@@ -21,7 +21,7 @@ const DERIV_WS_URLS = process.env.DERIV_WS_URL
 let urlIdx = 0;
 
 // === Siqnal parametrləri ===
-const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 72);
+const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 15);
 const SIGNAL_COOLDOWN_MIN = Number(process.env.SIGNAL_COOLDOWN_MIN || 10);
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
@@ -32,9 +32,9 @@ const DEFAULT_SYMBOLS = ['R_10','R_25','R_50','R_75','R_100'];
 const rawSyms = (process.env.DERIV_SYMBOLS || '').trim();
 const symbols = rawSyms ? rawSyms.split(',').map(s => s.trim()).filter(Boolean) : DEFAULT_SYMBOLS.slice();
 
-const TIMEFRAMES = ['1m', '5m'];
-const TREND_TF = '15m';
-const GRANULARITY = { '1m': 60, '5m': 300, '15m': 900 };
+const TIMEFRAMES = ['5m', '15m'];
+const TREND_TF = '1h';
+const GRANULARITY = { '5m': 300, '15m': 900, '1h:3600 };
 const ALL_TFS = [...TIMEFRAMES, TREND_TF];
 
 function key(symbol, tf) { return `${symbol}|${tf}`; }
