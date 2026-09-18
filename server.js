@@ -34,7 +34,7 @@ const symbols = rawSyms ? rawSyms.split(',').map(s => s.trim()).filter(Boolean) 
 
 const TIMEFRAMES = ['5m', '15m'];
 const TREND_TF = '1h';
-const GRANULARITY = { '5m': 300, '15m': 900, '1h':3600 };
+const GRANULARITY = { '5m': 300, '15m': 900, '1h': 3600 };
 const ALL_TFS = [...TIMEFRAMES, TREND_TF];
 
 function key(symbol, tf) { return `${symbol}|${tf}`; }
@@ -163,27 +163,32 @@ function analyze(c){
 function fullAnalysis(symbol){
   const a = {};
   for (const tf of ALL_TFS) a[tf] = analyze(getCandles(symbol, tf));
-  const m1 = a['1m'], m5 = a['5m'], m15 = a[TREND_TF];
-  if (!m1) return null;
+  const m5 = a['5m'], m15 = a['15m'], h1 = a[TREND_TF];
+  if (!m5) return null;
 
   let final = 'WAIT', expiry = null, strength = 'zəif';
-  if (m5 && m1.signal !== 'WAIT' && m1.signal === m5.signal) {
-    final = m1.signal; expiry = '5m'; strength = 'güclü (1m+5m uyğun)';
-  } else if (m15 && m1.signal !== 'WAIT' && m1.signal === m15.signal) {
-    final = m1.signal; expiry = '1m'; strength = 'erkən (1m+15m trend uyğun)';
+  let confluence = 0;
+  if (m5.signal !== 'WAIT') confluence++;
+  if (m15 && m15.signal === m5.signal) confluence++;
+  if (h1 && h1.signal === m5.signal) confluence++;
+
+  if (m15 && m5.signal !== 'WAIT' && m5.signal === m15.signal) {
+    final = m5.signal; expiry = '15m'; strength = 'güclü (5m+15m uyğun)';
+  } else if (h1 && m5.signal !== 'WAIT' && m5.signal === h1.signal) {
+    final = m5.signal; expiry = '5m'; strength = 'erkən (5m+1h trend uyğun)';
   }
 
-  let confidence = m1.confidence;
+  let confidence = m5.confidence;
   if (final !== 'WAIT') {
-    const parts = [m1.confidence, m5?.confidence, m15?.confidence].filter(x => x != null);
+    const parts = [m5.confidence, m15?.confidence, h1?.confidence].filter(x => x != null);
     confidence = Math.round(parts.reduce((s, x) => s + x, 0) / parts.length);
-    if (m5 && m5.signal === final) confidence = Math.min(100, confidence + 6);
-    if (m15 && m15.signal === final) confidence = Math.min(100, confidence + 4);
+    if (m15 && m15.signal === final) confidence = Math.min(100, confidence + 6);
+    if (h1 && h1.signal === final) confidence = Math.min(100, confidence + 4);
   }
 
   const dir = final === 'LONG' ? 'CALL' : final === 'SHORT' ? 'PUT' : 'WAIT';
-  const reasons = [...new Set([...(m1?.reasons||[]), ...(m5?.reasons||[])])].slice(0, 6);
-  return { symbol, dir, confidence, expiry, strength, price: m1.price, atr: m1.atr, rsi: m1.rsi, timeframes: a, reasons };
+  const reasons = [...new Set([...(m5?.reasons||[]), ...(m15?.reasons||[])])].slice(0, 6);
+  return { symbol, dir, confidence, expiry, strength, confluence, price: m5.price, atr: m5.atr, rsi: m5.rsi, timeframes: a, reasons };
 }
 
 function getCandles(symbol, tf) { return state.candles.get(key(symbol, tf)) || []; }
@@ -369,7 +374,9 @@ function onCandleUpdate(symbol) {
 }
 
 function runAnalysis(symbol) {
-  const r = fullAnalysis(symbol);
+  let r;
+  try { r = fullAnalysis(symbol); }
+  catch (e) { console.error(`[analiz] ${symbol} xətası:`, e.message); return; }
   if (!r) return;
   state.lastAnalysis.set(symbol, r);
   broadcast({ type: 'analysis', data: r });
@@ -380,10 +387,13 @@ function runAnalysis(symbol) {
   const prev = state.lastSignalAt.get(symbol);
   const cooldownMs = SIGNAL_COOLDOWN_MIN * 60 * 1000;
   const now = Date.now();
-  if (prev && prev.dir === r.dir && now - prev.ts < cooldownMs) return;
+  const dirChanged = !prev || prev.dir !== r.dir;
+  const bigConfidenceShift = prev && Math.abs((prev.confidence ?? 0) - r.confidence) >= 15;
+  const cooldownPassed = prev && now - prev.ts >= cooldownMs;
+  if (!dirChanged && !bigConfidenceShift && !cooldownPassed) return;
 
-  state.lastSignalAt.set(symbol, { dir: r.dir, ts: now });
-  const entry = { ts: now, symbol, dir: r.dir, confidence: r.confidence, expiry: r.expiry, price: r.price, reasons: r.reasons };
+  state.lastSignalAt.set(symbol, { dir: r.dir, ts: now, confidence: r.confidence });
+  const entry = { ts: now, symbol, dir: r.dir, confidence: r.confidence, expiry: r.expiry, strength: r.strength, confluence: r.confluence, price: r.price, reasons: r.reasons };
   state.signals.unshift(entry);
   state.signals = state.signals.slice(0, 200);
   saveState();
@@ -391,16 +401,31 @@ function runAnalysis(symbol) {
   sendTelegramSignal(r);
 }
 
-async function telegram(method, body) {
+async function telegram(method, body, attempt = 1) {
   if (!TELEGRAM_TOKEN) { console.error('[telegram] TELEGRAM_BOT_TOKEN boşdur'); return null; }
   try {
     const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
     });
     const j = await r.json();
-    if (j && j.ok === false) console.error(`[telegram] rədd edildi: ${j.description}`);
+    if (j && j.ok === false) {
+      console.error(`[telegram] rədd edildi: ${j.description}`);
+      // Rate limit (429) — Telegram-ın göstərdiyi müddət qədər gözləyib bir dəfə yenidən cəhd et
+      if (j.error_code === 429 && attempt < 3) {
+        const wait = ((j.parameters && j.parameters.retry_after) || 2) * 1000;
+        await new Promise(res => setTimeout(res, wait));
+        return telegram(method, body, attempt + 1);
+      }
+    }
     return j;
-  } catch (e) { console.error('[telegram] şəbəkə xətası:', e.message); return null; }
+  } catch (e) {
+    console.error('[telegram] şəbəkə xətası:', e.message);
+    if (attempt < 3) {
+      await new Promise(res => setTimeout(res, 1500 * attempt));
+      return telegram(method, body, attempt + 1);
+    }
+    return null;
+  }
 }
 function confBar(pct) { const filled = Math.round((pct || 0) / 10); return '█'.repeat(filled) + '░'.repeat(10 - filled); }
 function fmt(x) { return x == null ? '--' : Number(x).toLocaleString('en-US', { maximumFractionDigits: 5 }); }
@@ -408,9 +433,10 @@ async function sendTelegramSignal(r) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) { console.error('[telegram] TOKEN/CHAT_ID boşdur, siqnal göndərilmədi'); return; }
   const emoji = r.dir === 'CALL' ? '📈' : '📉';
   const dirText = r.dir === 'CALL' ? 'CALL (yuxarı)' : 'PUT (aşağı)';
-  const expText = r.expiry === '5m' ? '5 dəqiqə' : '1 dəqiqə';
+  const expText = r.expiry === '15m' ? '15 dəqiqə' : '5 dəqiqə';
+  const confluenceText = r.confluence != null ? ` — 🟢${r.confluence}/3` : '';
   const lines = [
-    `${emoji} <b>${r.symbol}</b> — <b>${dirText}</b>`,
+    `${emoji} <b>${r.symbol}</b> — <b>${dirText}</b>${confluenceText}`,
     `Tövsiyə olunan expiry: <b>${expText}</b> (${r.strength})`,
     `Etibar: <b>${r.confidence}%</b> ${confBar(r.confidence)}`,
     `Qiymət: <code>${fmt(r.price)}</code>`,
@@ -460,6 +486,12 @@ app.post('/api/scanner', requireAdmin, (req, res) => {
   res.json({ ok: true, scannerEnabled: state.scannerEnabled });
 });
 
+app.use((err, req, res, next) => {
+  console.error('[http] marşrut xətası:', err && err.stack || err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'daxili xəta' });
+});
+
 const server = app.listen(PORT, () => console.log(`[http] http://localhost:${PORT} dinlənilir`));
 const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', (ws) => {
@@ -468,5 +500,27 @@ wss.on('connection', (ws) => {
   ws.on('close', () => state.clients.delete(ws));
 });
 
+// Gözlənilməz xətalar serveri çökdürməsin — sadəcə logla və davam et
+process.on('uncaughtException', (e) => console.error('[fatal] tutulmamış xəta:', e && e.stack || e));
+process.on('unhandledRejection', (e) => console.error('[fatal] tutulmamış promise xətası:', e && e.stack || e));
+
+async function verifyTelegramOnBoot() {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.error('[telegram] TELEGRAM_BOT_TOKEN və ya TELEGRAM_CHAT_ID boşdur — Railway Variables-da doldur');
+    return;
+  }
+  const me = await telegram('getMe', {});
+  if (!me || me.ok === false) {
+    console.error('[telegram] Bot token yanlışdır, getMe uğursuz oldu');
+    return;
+  }
+  console.log(`[telegram] Bot təsdiqləndi: @${me.result.username}`);
+  await telegram('sendMessage', {
+    chat_id: TELEGRAM_CHAT_ID,
+    text: '✅ Deriv siqnal botu işə düşdü və bağlıdır.',
+  });
+}
+
 loadState();
 connectDeriv();
+verifyTelegramOnBoot();
