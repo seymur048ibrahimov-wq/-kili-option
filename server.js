@@ -21,7 +21,11 @@ const DERIV_WS_URLS = process.env.DERIV_WS_URL
 let urlIdx = 0;
 
 // === Siqnal parametrləri ===
-const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 15);
+// QEYD: əvvəlki dəyər (15) demək olar heç nəyi filtrləmirdi — score>=4 həddi ilə siqnal
+// yarandığı andaca confidence artıq ~27%-dən başlayır, ona görə 15% praktikada "filtrsiz" idi
+// və çoxlu zəif/yalan siqnal göndərirdi. backtest.js-in öz bucket analizi göstərir ki, real
+// statistik üstünlük yalnız ~65%+ etibar diapazonunda görünür — canlı botu da elə kalibrləyirik.
+const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 68);
 const SIGNAL_COOLDOWN_MIN = Number(process.env.SIGNAL_COOLDOWN_MIN || 10);
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
@@ -32,9 +36,9 @@ const DEFAULT_SYMBOLS = ['R_10','R_25','R_50','R_75','R_100'];
 const rawSyms = (process.env.DERIV_SYMBOLS || '').trim();
 const symbols = rawSyms ? rawSyms.split(',').map(s => s.trim()).filter(Boolean) : DEFAULT_SYMBOLS.slice();
 
-const TIMEFRAMES = ['5m', '15m'];
+const TIMEFRAMES = ['15m'];
 const TREND_TF = '1h';
-const GRANULARITY = { '5m': 300, '15m': 900, '1h': 3600 };
+const GRANULARITY = { '15m': 900, '1h': 3600 };
 const ALL_TFS = [...TIMEFRAMES, TREND_TF];
 
 function key(symbol, tf) { return `${symbol}|${tf}`; }
@@ -134,7 +138,11 @@ function fibLevels(c){
 
 function analyze(c){
   if(c.length<60)return null;
-  const close=c.map(x=>x.c),price=close.at(-1),e9=ema(close,9),e21=ema(close,21),e50=ema(close,50),e200=ema(close,200),rv=rsi(close),mv=macd(close),bb=bollinger(close),st=stochastic(c),av=atr(c),cv=cci(c),mf=mfi(c),ob=obvTrend(c),str=structure(c),ax=adx(c),vw=vwap(c),ich=ichimoku(c),psar=parabolicSar(c),piv=pivotPoints(c),fib=fibLevels(c);
+  const close=c.map(x=>x.c),price=close.at(-1),e9=ema(close,9),e21=ema(close,21),e50=ema(close,50),e200=ema(close,200),rv=rsi(close),mv=macd(close),bb=bollinger(close),st=stochastic(c),av=atr(c),cv=cci(c),str=structure(c),ax=adx(c),ich=ichimoku(c),psar=parabolicSar(c),piv=pivotPoints(c),fib=fibLevels(c);
+  // QEYD: OBV/MFI/VWAP HESABLANMIR — Deriv sintetik indekslərində real "volume" yoxdur
+  // (aşağıda hər şam üçün v:1 sabit qoyulur), ona görə bu indikatorlar burda mənasız/aldadıcı
+  // olardı və score-a əlavə "sanki-güvən" verərdi. OKX kripto versiyasında (real hədcm datası ilə)
+  // bunlar saxlanılıb, çünki orda faktiki məna daşıyır.
   let score=0,reasons=[];
   if(e9>e21&&e21>e50){score+=1;reasons.push('EMA trend +');}else if(e9<e21&&e21<e50){score-=1;reasons.push('EMA trend -');}
   if(e200!=null){if(price>e200){score+=1;reasons.push('EMA200 üzərində');}else{score-=1;reasons.push('EMA200 altında');}}
@@ -143,15 +151,12 @@ function analyze(c){
   if(bb){if(price<=bb.lower){score+=1;reasons.push('BB alt zolaq');}else if(price>=bb.upper){score-=1;reasons.push('BB üst zolaq');}}
   if(st<20){score+=1;reasons.push('Stoch oversold');}else if(st>80){score-=1;reasons.push('Stoch overbought');}
   if(cv<-100){score+=1;reasons.push('CCI oversold');}else if(cv>100){score-=1;reasons.push('CCI overbought');}
-  if(mf<25){score+=1;reasons.push('MFI low');}else if(mf>75){score-=1;reasons.push('MFI high');}
-  if(ob>0){score+=1;reasons.push('OBV yüksəlir');}else if(ob<0){score-=1;reasons.push('OBV düşür');}
   if(str>0){score+=1;reasons.push('higher highs/lows');}else if(str<0){score-=1;reasons.push('lower highs/lows');}
-  if(vw!=null){if(price>vw){score+=1;reasons.push('VWAP üzərində');}else{score-=1;reasons.push('VWAP altında');}}
   if(ich&&ich.score!==0){if(ich.score>0){score+=1;reasons.push('Ichimoku bulud üzərində');}else{score-=1;reasons.push('Ichimoku bulud altında');}}
   if(psar){if(psar.uptrend){score+=1;reasons.push('Parabolic SAR yüksəliş');}else{score-=1;reasons.push('Parabolic SAR düşüş');}}
   if(piv){if(price>piv.pp){score+=1;reasons.push('Pivot üzərində');}else if(price<piv.pp){score-=1;reasons.push('Pivot altında');}}
   if(fib){if(price>fib.r500){score+=1;reasons.push('Fib 50% üzərində');}else{score-=1;reasons.push('Fib 50% altında');}}
-  let confidence=Math.round(Math.min(100,Math.abs(score)/15*100));
+  let confidence=Math.round(Math.min(100,Math.abs(score)/12*100));
   if(ax!=null){
     if(ax>=25){confidence=Math.min(100,confidence+8);reasons.push(`ADX güclü trend (${ax.toFixed(0)})`);}
     else if(ax<15){confidence=Math.max(0,confidence-12);reasons.push(`ADX zəif/yan bazar (${ax.toFixed(0)})`);}
@@ -163,32 +168,28 @@ function analyze(c){
 function fullAnalysis(symbol){
   const a = {};
   for (const tf of ALL_TFS) a[tf] = analyze(getCandles(symbol, tf));
-  const m5 = a['5m'], m15 = a['15m'], h1 = a[TREND_TF];
-  if (!m5) return null;
+  const m15 = a['15m'], h1 = a[TREND_TF];
+  if (!m15) return null;
 
   let final = 'WAIT', expiry = null, strength = 'zəif';
   let confluence = 0;
-  if (m5.signal !== 'WAIT') confluence++;
-  if (m15 && m15.signal === m5.signal) confluence++;
-  if (h1 && h1.signal === m5.signal) confluence++;
+  if (m15.signal !== 'WAIT') confluence++;
+  if (h1 && h1.signal === m15.signal) confluence++;
 
-  if (m15 && m5.signal !== 'WAIT' && m5.signal === m15.signal) {
-    final = m5.signal; expiry = '15m'; strength = 'güclü (5m+15m uyğun)';
-  } else if (h1 && m5.signal !== 'WAIT' && m5.signal === h1.signal) {
-    final = m5.signal; expiry = '5m'; strength = 'erkən (5m+1h trend uyğun)';
+  if (h1 && m15.signal !== 'WAIT' && m15.signal === h1.signal) {
+    final = m15.signal; expiry = '15m'; strength = 'güclü (15m+1h trend uyğun)';
   }
 
-  let confidence = m5.confidence;
+  let confidence = m15.confidence;
   if (final !== 'WAIT') {
-    const parts = [m5.confidence, m15?.confidence, h1?.confidence].filter(x => x != null);
+    const parts = [m15.confidence, h1?.confidence].filter(x => x != null);
     confidence = Math.round(parts.reduce((s, x) => s + x, 0) / parts.length);
-    if (m15 && m15.signal === final) confidence = Math.min(100, confidence + 6);
-    if (h1 && h1.signal === final) confidence = Math.min(100, confidence + 4);
+    if (h1 && h1.signal === final) confidence = Math.min(100, confidence + 6);
   }
 
   const dir = final === 'LONG' ? 'CALL' : final === 'SHORT' ? 'PUT' : 'WAIT';
-  const reasons = [...new Set([...(m5?.reasons||[]), ...(m15?.reasons||[])])].slice(0, 6);
-  return { symbol, dir, confidence, expiry, strength, confluence, price: m5.price, atr: m5.atr, rsi: m5.rsi, timeframes: a, reasons };
+  const reasons = [...new Set([...(m15?.reasons||[]), ...(h1?.reasons||[])])].slice(0, 6);
+  return { symbol, dir, confidence, expiry, strength, confluence, price: m15.price, atr: m15.atr, rsi: m15.rsi, timeframes: a, reasons };
 }
 
 function getCandles(symbol, tf) { return state.candles.get(key(symbol, tf)) || []; }
@@ -434,7 +435,7 @@ async function sendTelegramSignal(r) {
   const emoji = r.dir === 'CALL' ? '📈' : '📉';
   const dirText = r.dir === 'CALL' ? 'CALL (yuxarı)' : 'PUT (aşağı)';
   const expText = r.expiry === '15m' ? '15 dəqiqə' : '5 dəqiqə';
-  const confluenceText = r.confluence != null ? ` — 🟢${r.confluence}/3` : '';
+  const confluenceText = r.confluence != null ? ` — 🟢${r.confluence}/2` : '';
   const lines = [
     `${emoji} <b>${r.symbol}</b> — <b>${dirText}</b>${confluenceText}`,
     `Tövsiyə olunan expiry: <b>${expText}</b> (${r.strength})`,
