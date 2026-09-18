@@ -183,7 +183,6 @@ function getCandles(symbol, tf) { return state.candles.get(key(symbol, tf)) || [
 
 let derivWs = null;
 let reqSeq = 1;
-const pendingCandleReqs = new Map(); // req_id -> {symbol, tf}
 function connectDeriv() {
   derivWs = new WebSocket(DERIV_WS_URL);
 
@@ -196,8 +195,6 @@ function connectDeriv() {
   function subscribeCandles(symbolList) {
     for (const symbol of symbolList) {
       for (const tf of ALL_TFS) {
-        const req_id = reqSeq++;
-        pendingCandleReqs.set(req_id, { symbol, tf });
         derivWs.send(JSON.stringify({
           ticks_history: symbol,
           style: 'candles',
@@ -205,7 +202,7 @@ function connectDeriv() {
           count: 300,
           end: 'latest',
           subscribe: 1,
-          req_id,
+          req_id: reqSeq++,
         }));
       }
     }
@@ -216,8 +213,9 @@ function connectDeriv() {
     if (msg.error) { console.error('[deriv] xəta:', msg.error.message); return; }
 
     if (msg.msg_type === 'active_symbols' && Array.isArray(msg.active_symbols)) {
-      const all = msg.active_symbols.map(s => s.underlying_symbol || s.symbol);
-      const synthetic = msg.active_symbols.filter(s => s.market === 'synthetic_index').map(s => s.underlying_symbol || s.symbol);
+      const symOf = s => s.underlying_symbol || s.symbol;
+      const all = msg.active_symbols.map(symOf);
+      const synthetic = msg.active_symbols.filter(s => s.market === 'synthetic_index').map(symOf);
       state.availableSymbols = all;
       let finalSymbols = symbols.filter(s => all.includes(s));
       if (!finalSymbols.length) {
@@ -232,13 +230,9 @@ function connectDeriv() {
       subscribeCandles(finalSymbols);
     }
 
-    if (msg.msg_type === 'candles') {
-      let symbol = msg.echo_req?.ticks_history;
-      let tf = msg.echo_req ? tfFromGranularity(msg.echo_req.granularity) : null;
-      if ((!symbol || !tf) && msg.req_id != null && pendingCandleReqs.has(msg.req_id)) {
-        ({ symbol, tf } = pendingCandleReqs.get(msg.req_id));
-      }
-      if (msg.req_id != null) pendingCandleReqs.delete(msg.req_id);
+    if (msg.msg_type === 'candles' && msg.echo_req) {
+      const symbol = msg.echo_req.ticks_history;
+      const tf = tfFromGranularity(msg.echo_req.granularity);
       if (!symbol || !tf || !Array.isArray(msg.candles)) return;
       const arr = msg.candles.map(k => ({ t: k.epoch * 1000, o: +k.open, h: +k.high, l: +k.low, c: +k.close, v: 1 }));
       state.candles.set(key(symbol, tf), arr);
