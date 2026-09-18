@@ -213,6 +213,10 @@ function connectDeriv() {
     if (msg.error) { console.error('[deriv] xəta:', msg.error.message); return; }
 
     if (msg.msg_type === 'active_symbols' && Array.isArray(msg.active_symbols)) {
+      console.log(`[deriv][debug] cəmi simvol sayı: ${msg.active_symbols.length}`);
+      console.log(`[deriv][debug] nümunə obyekt: ${JSON.stringify(msg.active_symbols[0])}`);
+      console.log(`[deriv][debug] ilk 10 simvol adı: ${msg.active_symbols.slice(0,10).map(s => s.underlying_symbol || s.symbol).join(', ')}`);
+      console.log(`[deriv][debug] mövcud market növləri: ${[...new Set(msg.active_symbols.map(s => s.market))].join(', ')}`);
       const symOf = s => s.underlying_symbol || s.symbol;
       const all = msg.active_symbols.map(symOf);
       const synthetic = msg.active_symbols.filter(s => s.market === 'synthetic_index').map(symOf);
