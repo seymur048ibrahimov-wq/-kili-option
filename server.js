@@ -25,7 +25,7 @@ let urlIdx = 0;
 // yarandığı andaca confidence artıq ~27%-dən başlayır, ona görə 15% praktikada "filtrsiz" idi
 // və çoxlu zəif/yalan siqnal göndərirdi. backtest.js-in öz bucket analizi göstərir ki, real
 // statistik üstünlük yalnız ~65%+ etibar diapazonunda görünür — canlı botu da elə kalibrləyirik.
-const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 68);
+const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 20);
 const SIGNAL_COOLDOWN_MIN = Number(process.env.SIGNAL_COOLDOWN_MIN || 10);
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
