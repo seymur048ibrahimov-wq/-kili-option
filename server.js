@@ -9,8 +9,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8788);
 
 // === Deriv bağlantısı ===
-const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089'; // özün app_id qeyd et (Deriv API-də yaradılır)
-const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN || ''; // auto-trade mərhələsi üçün lazım olacaq, indi istifadə olunmur
+const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
+const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN || '';
 const DERIV_WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
 
 // === Siqnal parametrləri ===
@@ -21,12 +21,10 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
 const STATE_FILE = process.env.STATE_FILE || '/tmp/deriv13-state.json';
 
-// Default: Deriv-in 24/7 işləyən sintetik volatilite indeksləri (ən çox binar üçün istifadə olunur)
 const DEFAULT_SYMBOLS = ['R_10','R_25','R_50','R_75','R_100'];
 const rawSyms = (process.env.DERIV_SYMBOLS || '').trim();
 const symbols = rawSyms ? rawSyms.split(',').map(s => s.trim()).filter(Boolean) : DEFAULT_SYMBOLS.slice();
 
-// Konfluensiya üçün 2 sürətli TF, + 1 trend filtri (macro əvəzi — binarda uzun TF mənasızdır)
 const TIMEFRAMES = ['1m', '5m'];
 const TREND_TF = '15m';
 const GRANULARITY = { '1m': 60, '5m': 300, '15m': 900 };
@@ -38,20 +36,21 @@ const state = {
   startedAt: Date.now(),
   derivConnected: false,
   scannerEnabled: true,
-  candles: new Map(),      // key(symbol,tf) -> [{t,o,h,l,c,v,confirm}]
-  lastAnalysis: new Map(), // symbol -> full analysis result
-  signals: [],             // { ts, symbol, dir, confidence, expiry, reasons }
-  lastSignalAt: new Map(), // symbol -> {dir, ts}
-  clients: new Set(),      // dashboard WS clients
+  candles: new Map(),
+  lastAnalysis: new Map(),
+  signals: [],
+  lastSignalAt: new Map(),
+  clients: new Set(),
+  activeSymbols: symbols.slice(),
+  availableSymbols: [],
 };
 
-// ========================= STATE PERSISTENCE (sadə fayl-based) =========================
 function saveState() {
   const dump = {
     signals: state.signals.slice(-200),
     lastSignalAt: [...state.lastSignalAt.entries()],
   };
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(dump)); } catch (e) { /* best-effort */ }
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify(dump)); } catch (e) {}
 }
 function loadState() {
   try {
@@ -59,10 +58,9 @@ function loadState() {
     const d = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     if (Array.isArray(d.signals)) state.signals = d.signals;
     if (Array.isArray(d.lastSignalAt)) state.lastSignalAt = new Map(d.lastSignalAt);
-  } catch (e) { /* ignore */ }
+  } catch (e) {}
 }
 
-// ========================= İNDİKATORLAR (SIQNAL PRO ilə eyni məntiq) =========================
 function ema(a,p){ if(a.length<p) return null; const k=2/(p+1); let e=a.slice(0,p).reduce((x,y)=>x+y,0)/p; for(let i=p;i<a.length;i++) e=a[i]*k+e*(1-k); return e; }
 function sma(a,p){ if(a.length<p) return null; return a.slice(-p).reduce((x,y)=>x+y,0)/p; }
 function rsi(a,p=14){ if(a.length<p+1)return null; let g=0,l=0; for(let i=1;i<=p;i++){const d=a[i]-a[i-1];if(d>0)g+=d;else l-=d;}let ag=g/p,al=l/p;for(let i=p+1;i<a.length;i++){const d=a[i]-a[i-1];ag=(ag*(p-1)+(d>0?d:0))/p;al=(al*(p-1)+(d<0?-d:0))/p;}return al===0?100:100-100/(1+ag/al); }
@@ -127,7 +125,6 @@ function fibLevels(c){
   return{hi,lo,r382:hi-diff*0.382,r500:hi-diff*0.5,r618:hi-diff*0.618};
 }
 
-// Bir TF üçün: indikatorların konfluensiyasına görə LONG/SHORT/WAIT + etibar faizi
 function analyze(c){
   if(c.length<60)return null;
   const close=c.map(x=>x.c),price=close.at(-1),e9=ema(close,9),e21=ema(close,21),e50=ema(close,50),e200=ema(close,200),rv=rsi(close),mv=macd(close),bb=bollinger(close),st=stochastic(c),av=atr(c),cv=cci(c),mf=mfi(c),ob=obvTrend(c),str=structure(c),ax=adx(c),vw=vwap(c),ich=ichimoku(c),psar=parabolicSar(c),piv=pivotPoints(c),fib=fibLevels(c);
@@ -156,7 +153,6 @@ function analyze(c){
   return{signal,confidence,score,price,atr:av,rsi:rv,adx:ax,reasons};
 }
 
-// TIMEFRAMES (1m+5m) uyğunluğu + 15m trend filtri -> son CALL/PUT qərarı və tövsiyə olunan expiry
 function fullAnalysis(symbol){
   const a = {};
   for (const tf of ALL_TFS) a[tf] = analyze(getCandles(symbol, tf));
@@ -185,7 +181,6 @@ function fullAnalysis(symbol){
 
 function getCandles(symbol, tf) { return state.candles.get(key(symbol, tf)) || []; }
 
-// ========================= DERIV WS (məlumat mənbəyi) =========================
 let derivWs = null;
 let reqSeq = 1;
 function connectDeriv() {
@@ -193,8 +188,12 @@ function connectDeriv() {
 
   derivWs.on('open', () => {
     state.derivConnected = true;
-    console.log('[deriv] bağlantı quruldu');
-    for (const symbol of symbols) {
+    console.log('[deriv] bağlantı quruldu, aktiv simvollar soruşulur...');
+    derivWs.send(JSON.stringify({ active_symbols: 'brief', product_type: 'basic', req_id: reqSeq++ }));
+  });
+
+  function subscribeCandles(symbolList) {
+    for (const symbol of symbolList) {
       for (const tf of ALL_TFS) {
         derivWs.send(JSON.stringify({
           ticks_history: symbol,
@@ -207,11 +206,28 @@ function connectDeriv() {
         }));
       }
     }
-  });
+  }
 
   derivWs.on('message', (raw) => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
     if (msg.error) { console.error('[deriv] xəta:', msg.error.message); return; }
+
+    if (msg.msg_type === 'active_symbols' && Array.isArray(msg.active_symbols)) {
+      const all = msg.active_symbols.map(s => s.symbol);
+      const synthetic = msg.active_symbols.filter(s => s.market === 'synthetic_index').map(s => s.symbol);
+      state.availableSymbols = all;
+      let finalSymbols = symbols.filter(s => all.includes(s));
+      if (!finalSymbols.length) {
+        finalSymbols = synthetic.slice(0, 5);
+        console.warn(`[deriv] Tələb olunan simvollar (${symbols.join(',')}) tapılmadı. Əvəzinə: ${finalSymbols.join(',')}`);
+      } else if (finalSymbols.length < symbols.length) {
+        const missing = symbols.filter(s => !all.includes(s));
+        console.warn(`[deriv] Bu simvollar mövcud deyil, ötürüldü: ${missing.join(',')}`);
+      }
+      state.activeSymbols = finalSymbols;
+      console.log(`[deriv] İstifadə olunan simvollar: ${finalSymbols.join(', ')}`);
+      subscribeCandles(finalSymbols);
+    }
 
     if (msg.msg_type === 'candles' && msg.echo_req) {
       const symbol = msg.echo_req.ticks_history;
@@ -249,10 +265,8 @@ function tfFromGranularity(g) {
   return null;
 }
 
-// Hər canlı şam yeniləməsində analiz et (ucuz əməliyyatdır) və lazım olsa siqnal göndər
 let analysisTimers = new Map();
 function onCandleUpdate(symbol) {
-  // Bir simvol üçün qısa müddətdə çoxlu tick gəlirsə, analizi 500ms-dən bir dəfə işə sal (debounce)
   if (analysisTimers.has(symbol)) return;
   analysisTimers.set(symbol, setTimeout(() => {
     analysisTimers.delete(symbol);
@@ -283,7 +297,6 @@ function runAnalysis(symbol) {
   sendTelegramSignal(r);
 }
 
-// ========================= TELEGRAM =========================
 async function telegram(method, body) {
   if (!TELEGRAM_TOKEN) { console.error('[telegram] TELEGRAM_BOT_TOKEN boşdur'); return null; }
   try {
@@ -313,13 +326,11 @@ async function sendTelegramSignal(r) {
   await telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: lines.join('\n'), parse_mode: 'HTML' });
 }
 
-// ========================= DASHBOARD (local WS broadcast) =========================
 function broadcast(msg) {
   const s = JSON.stringify(msg);
   for (const c of state.clients) { if (c.readyState === 1) c.send(s); }
 }
 
-// ========================= HTTP / API =========================
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -335,7 +346,7 @@ app.get('/api/state', (req, res) => {
     online: true,
     derivConnected: state.derivConnected,
     scannerEnabled: state.scannerEnabled,
-    symbols,
+    symbols: state.activeSymbols,
     signals: state.signals.slice(0, 50),
     analysis: Object.fromEntries(state.lastAnalysis),
     startedAt: state.startedAt,
