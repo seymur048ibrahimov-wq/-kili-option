@@ -213,8 +213,8 @@ function connectDeriv() {
     if (msg.error) { console.error('[deriv] xəta:', msg.error.message); return; }
 
     if (msg.msg_type === 'active_symbols' && Array.isArray(msg.active_symbols)) {
-      const all = msg.active_symbols.map(s => s.symbol);
-      const synthetic = msg.active_symbols.filter(s => s.market === 'synthetic_index').map(s => s.symbol);
+      const all = msg.active_symbols.map(s => s.underlying_symbol || s.symbol);
+      const synthetic = msg.active_symbols.filter(s => s.market === 'synthetic_index').map(s => s.underlying_symbol || s.symbol);
       state.availableSymbols = all;
       let finalSymbols = symbols.filter(s => all.includes(s));
       if (!finalSymbols.length) {
