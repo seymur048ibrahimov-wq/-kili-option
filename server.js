@@ -11,7 +11,14 @@ const PORT = Number(process.env.PORT || 8788);
 // === Deriv bağlantısı ===
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
 const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN || '';
-const DERIV_WS_URL = process.env.DERIV_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
+// Əvvəl yeni public endpoint, alınmasa köhnə endpoint (avtomatik növbələnir)
+const DERIV_WS_URLS = process.env.DERIV_WS_URL
+  ? [process.env.DERIV_WS_URL]
+  : [
+      'wss://api.derivws.com/trading/v1/options/ws/public',
+      `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`,
+    ];
+let urlIdx = 0;
 
 // === Siqnal parametrləri ===
 const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 72);
@@ -197,10 +204,24 @@ function connectDeriv() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   reqMeta.clear();
   subMeta.clear();
-  derivWs = new WebSocket(DERIV_WS_URL);
+  const wsUrl = DERIV_WS_URLS[urlIdx % DERIV_WS_URLS.length];
+  console.log(`[deriv] qoşulur: ${wsUrl.split('?')[0]}`);
+  derivWs = new WebSocket(wsUrl);
   const ws = derivWs;
+  let gotCandles = false;
+  let invalidCount = 0;
+  let opened = false;
+  let rotated = false;
+  const rotate = (why) => {
+    if (rotated || DERIV_WS_URLS.length < 2) return;
+    rotated = true;
+    urlIdx++;
+    console.warn(`[deriv] ${why} — başqa endpoint-ə keçilir`);
+    try { ws.close(); } catch {}
+  };
 
   ws.on('open', () => {
+    opened = true;
     state.derivConnected = true;
     console.log('[deriv] bağlantı quruldu, aktiv simvollar soruşulur...');
     ws.send(JSON.stringify({ active_symbols: 'brief', req_id: reqSeq++ }));
@@ -252,29 +273,46 @@ function connectDeriv() {
     if (msg.error) {
       const m = msg.req_id != null ? reqMeta.get(msg.req_id) : null;
       console.error('[deriv] xəta:', msg.error.message, m ? `(${m.symbol} ${m.tf})` : '');
+      if (/invalid/i.test(msg.error.message || '') && m) {
+        invalidCount++;
+        if (!gotCandles && invalidCount >= state.activeSymbols.length * ALL_TFS.length) {
+          rotate('bütün simvollar etibarsız sayıldı');
+        }
+      }
       return;
     }
 
     if (msg.msg_type === 'active_symbols' && Array.isArray(msg.active_symbols)) {
       const list = msg.active_symbols;
-      if (list.length) console.log('[deriv] nümunə simvol sahələri:', Object.keys(list[0]).join(','));
       const all = list.map(symOf).filter(Boolean);
-      const synthetic = list.filter(s => s.market === 'synthetic_index').map(symOf).filter(Boolean);
+      const nameOf = (s) => s.underlying_symbol_name || s.display_name || '';
+      const synthetic = list.filter(s => s.market === 'synthetic_index');
       state.availableSymbols = all;
       console.log(`[deriv] cəmi ${all.length} simvol, ${synthetic.length} sintetik`);
+      if (!list.length) {
+        console.warn('[deriv] xam cavab:', String(raw).slice(0, 300));
+      } else {
+        console.log('[deriv] nümunə sahələr:', Object.keys(list[0]).join(','));
+        console.log('[deriv] sintetik simvollar:', synthetic.slice(0, 40).map(s => `${symOf(s)}="${nameOf(s)}"`).join(' | '));
+      }
 
-      let finalSymbols = symbols.filter(s => all.includes(s));
-      if (!finalSymbols.length) {
-        finalSymbols = synthetic.slice(0, 5);
-        console.warn(`[deriv] Tələb olunan simvollar (${symbols.join(',')}) tapılmadı. Əvəzinə: ${finalSymbols.join(',')}`);
-        if (!finalSymbols.length) {
-          // Siyahı boş/oxunmazdırsa, birbaşa tələb olunanları sınayırıq
-          finalSymbols = symbols.slice();
-          console.warn('[deriv] Siyahıdan simvol çıxarıla bilmədi — tələb olunanlar birbaşa abunə edilir');
+      // Hər tələb olunan simvol üçün: dəqiq ad → "Volatility N Index" adı ilə axtarış
+      const resolved = [];
+      for (const want of symbols) {
+        if (all.includes(want)) { resolved.push(want); continue; }
+        const m = /^R_(\d+)$/.exec(want);
+        if (m) {
+          const re = new RegExp(`^volatility\\s*${m[1]}\\s*index$`, 'i');
+          const hit = list.find(s => re.test(nameOf(s).trim()));
+          if (hit) { console.log(`[deriv] ${want} → ${symOf(hit)} (ad ilə tapıldı)`); resolved.push(symOf(hit)); continue; }
         }
-      } else if (finalSymbols.length < symbols.length) {
-        const missing = symbols.filter(s => !all.includes(s));
-        console.warn(`[deriv] Bu simvollar mövcud deyil, ötürüldü: ${missing.join(',')}`);
+        console.warn(`[deriv] simvol tapılmadı: ${want}`);
+      }
+      const finalSymbols = [...new Set(resolved)];
+
+      if (!finalSymbols.length) {
+        rotate('heç bir simvol tapılmadı');
+        return;
       }
       state.activeSymbols = finalSymbols;
       console.log(`[deriv] İstifadə olunan simvollar: ${finalSymbols.join(', ')}`);
@@ -285,6 +323,7 @@ function connectDeriv() {
     if (msg.msg_type === 'candles' && Array.isArray(msg.candles)) {
       const meta = resolveMeta(msg, msg.echo_req && msg.echo_req.granularity, msg.echo_req && msg.echo_req.ticks_history);
       if (!meta) return;
+      gotCandles = true;
       const arr = msg.candles.map(k => ({ t: k.epoch * 1000, o: +k.open, h: +k.high, l: +k.low, c: +k.close, v: 1 }));
       state.candles.set(key(meta.symbol, meta.tf), arr);
       return;
@@ -309,6 +348,7 @@ function connectDeriv() {
   ws.on('close', () => {
     state.derivConnected = false;
     clearInterval(pingTimer);
+    if (!opened && DERIV_WS_URLS.length > 1) urlIdx++;
     console.log('[deriv] bağlantı kəsildi, 3 saniyə sonra yenidən qoşulacaq');
     if (!reconnectTimer) reconnectTimer = setTimeout(connectDeriv, 3000);
   });
