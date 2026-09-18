@@ -11,7 +11,7 @@ const PORT = Number(process.env.PORT || 8788);
 // === Deriv bağlantısı ===
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
 const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN || '';
-const DERIV_WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
+const DERIV_WS_URL = process.env.DERIV_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
 
 // === Siqnal parametrləri ===
 const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 72);
@@ -183,43 +183,95 @@ function getCandles(symbol, tf) { return state.candles.get(key(symbol, tf)) || [
 
 let derivWs = null;
 let reqSeq = 1;
-function connectDeriv() {
-  derivWs = new WebSocket(DERIV_WS_URL);
+let pingTimer = null;
+let reconnectTimer = null;
+// req_id -> { symbol, tf }  (yeni Deriv API cavabda echo_req qaytarmaya bilər)
+const reqMeta = new Map();
+// subscription.id -> { symbol, tf }
+const subMeta = new Map();
 
-  derivWs.on('open', () => {
+// Köhnə API: s.symbol | Yeni API: s.underlying_symbol
+const symOf = (s) => (s && (s.symbol || s.underlying_symbol)) || null;
+
+function connectDeriv() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reqMeta.clear();
+  subMeta.clear();
+  derivWs = new WebSocket(DERIV_WS_URL);
+  const ws = derivWs;
+
+  ws.on('open', () => {
     state.derivConnected = true;
     console.log('[deriv] bağlantı quruldu, aktiv simvollar soruşulur...');
-    derivWs.send(JSON.stringify({ active_symbols: 'brief', req_id: reqSeq++ }));
+    ws.send(JSON.stringify({ active_symbols: 'brief', req_id: reqSeq++ }));
+    // Deriv boş qalan bağlantını bağlayır — hər 30 san ping
+    clearInterval(pingTimer);
+    pingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ping: 1 }));
+    }, 30000);
   });
 
   function subscribeCandles(symbolList) {
     for (const symbol of symbolList) {
       for (const tf of ALL_TFS) {
-        derivWs.send(JSON.stringify({
+        const id = reqSeq++;
+        reqMeta.set(id, { symbol, tf });
+        ws.send(JSON.stringify({
           ticks_history: symbol,
           style: 'candles',
           granularity: GRANULARITY[tf],
           count: 300,
           end: 'latest',
           subscribe: 1,
-          req_id: reqSeq++,
+          req_id: id,
         }));
       }
     }
   }
 
-  derivWs.on('message', (raw) => {
+  // Cavabdan (symbol, tf) tapır: req_id → subscription.id → echo_req → sahələr
+  function resolveMeta(msg, granularity, symbolField) {
+    let meta = (msg.req_id != null && reqMeta.get(msg.req_id)) || null;
+    if (!meta && msg.subscription && msg.subscription.id) meta = subMeta.get(msg.subscription.id) || null;
+    if (!meta && msg.echo_req) {
+      const symbol = msg.echo_req.ticks_history;
+      const tf = tfFromGranularity(msg.echo_req.granularity);
+      if (symbol && tf) meta = { symbol, tf };
+    }
+    if (!meta && symbolField && granularity) {
+      const tf = tfFromGranularity(granularity);
+      if (tf) meta = { symbol: symbolField, tf };
+    }
+    if (meta && msg.subscription && msg.subscription.id) subMeta.set(msg.subscription.id, meta);
+    return meta;
+  }
+
+  ws.on('message', (raw) => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
-    if (msg.error) { console.error('[deriv] xəta:', msg.error.message); return; }
+    if (msg.msg_type === 'ping') return;
+    if (msg.error) {
+      const m = msg.req_id != null ? reqMeta.get(msg.req_id) : null;
+      console.error('[deriv] xəta:', msg.error.message, m ? `(${m.symbol} ${m.tf})` : '');
+      return;
+    }
 
     if (msg.msg_type === 'active_symbols' && Array.isArray(msg.active_symbols)) {
-      const all = msg.active_symbols.map(s => s.underlying_symbol || s.symbol);
-      const synthetic = msg.active_symbols.filter(s => s.market === 'synthetic_index').map(s => s.underlying_symbol || s.symbol);
+      const list = msg.active_symbols;
+      if (list.length) console.log('[deriv] nümunə simvol sahələri:', Object.keys(list[0]).join(','));
+      const all = list.map(symOf).filter(Boolean);
+      const synthetic = list.filter(s => s.market === 'synthetic_index').map(symOf).filter(Boolean);
       state.availableSymbols = all;
+      console.log(`[deriv] cəmi ${all.length} simvol, ${synthetic.length} sintetik`);
+
       let finalSymbols = symbols.filter(s => all.includes(s));
       if (!finalSymbols.length) {
         finalSymbols = synthetic.slice(0, 5);
         console.warn(`[deriv] Tələb olunan simvollar (${symbols.join(',')}) tapılmadı. Əvəzinə: ${finalSymbols.join(',')}`);
+        if (!finalSymbols.length) {
+          // Siyahı boş/oxunmazdırsa, birbaşa tələb olunanları sınayırıq
+          finalSymbols = symbols.slice();
+          console.warn('[deriv] Siyahıdan simvol çıxarıla bilmədi — tələb olunanlar birbaşa abunə edilir');
+        }
       } else if (finalSymbols.length < symbols.length) {
         const missing = symbols.filter(s => !all.includes(s));
         console.warn(`[deriv] Bu simvollar mövcud deyil, ötürüldü: ${missing.join(',')}`);
@@ -227,21 +279,22 @@ function connectDeriv() {
       state.activeSymbols = finalSymbols;
       console.log(`[deriv] İstifadə olunan simvollar: ${finalSymbols.join(', ')}`);
       subscribeCandles(finalSymbols);
+      return;
     }
 
-    if (msg.msg_type === 'candles' && msg.echo_req) {
-      const symbol = msg.echo_req.ticks_history;
-      const tf = tfFromGranularity(msg.echo_req.granularity);
-      if (!symbol || !tf || !Array.isArray(msg.candles)) return;
+    if (msg.msg_type === 'candles' && Array.isArray(msg.candles)) {
+      const meta = resolveMeta(msg, msg.echo_req && msg.echo_req.granularity, msg.echo_req && msg.echo_req.ticks_history);
+      if (!meta) return;
       const arr = msg.candles.map(k => ({ t: k.epoch * 1000, o: +k.open, h: +k.high, l: +k.low, c: +k.close, v: 1 }));
-      state.candles.set(key(symbol, tf), arr);
+      state.candles.set(key(meta.symbol, meta.tf), arr);
+      return;
     }
 
     if (msg.msg_type === 'ohlc' && msg.ohlc) {
       const o = msg.ohlc;
-      const symbol = o.symbol;
-      const tf = tfFromGranularity(o.granularity);
-      if (!symbol || !tf) return;
+      const meta = resolveMeta(msg, o.granularity, o.symbol || o.underlying_symbol);
+      if (!meta) return;
+      const { symbol, tf } = meta;
       const arr = state.candles.get(key(symbol, tf)) || [];
       const epochMs = Number(o.open_time) * 1000;
       const candle = { t: epochMs, o: +o.open, h: +o.high, l: +o.low, c: +o.close, v: 1 };
@@ -253,12 +306,13 @@ function connectDeriv() {
     }
   });
 
-  derivWs.on('close', () => {
+  ws.on('close', () => {
     state.derivConnected = false;
+    clearInterval(pingTimer);
     console.log('[deriv] bağlantı kəsildi, 3 saniyə sonra yenidən qoşulacaq');
-    setTimeout(connectDeriv, 3000);
+    if (!reconnectTimer) reconnectTimer = setTimeout(connectDeriv, 3000);
   });
-  derivWs.on('error', (e) => console.error('[deriv] WS xətası:', e.message));
+  ws.on('error', (e) => console.error('[deriv] WS xətası:', e.message));
 }
 function tfFromGranularity(g) {
   for (const tf of Object.keys(GRANULARITY)) if (GRANULARITY[tf] === Number(g)) return tf;
