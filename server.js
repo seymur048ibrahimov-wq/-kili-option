@@ -34,7 +34,7 @@ const symbols = rawSyms ? rawSyms.split(',').map(s => s.trim()).filter(Boolean) 
 
 const TIMEFRAMES = ['5m', '15m'];
 const TREND_TF = '1h';
-const GRANULARITY = { '5m': 300, '15m': 900, '1h:3600 };
+const GRANULARITY = { '5m': 300, '15m': 900, '1h':3600 };
 const ALL_TFS = [...TIMEFRAMES, TREND_TF];
 
 function key(symbol, tf) { return `${symbol}|${tf}`; }
