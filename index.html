@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="az">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>SEYMUR13 DERIV</title>
+<link rel="manifest" href="./manifest.json" />
+<link rel="icon" href="./icon-192.png" />
+<meta name="theme-color" content="#0a0e14" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#10151f; --panel2:#141b28; --line:#1d2634;
+    --text:#e7ebf2; --muted:#7b8698; --brand:#e0202f;
+    --up:#26d67a; --down:#ff4d6a; --wait:#4a5568;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
+  .mono{font-family:'JetBrains Mono',monospace;}
+  header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,var(--bg) 80%,transparent);
+    padding:16px 16px 8px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--line);}
+  header img{width:34px;height:34px;border-radius:8px;}
+  header h1{font-size:15px;margin:0;letter-spacing:.02em;}
+  header .sub{font-size:11px;color:var(--muted);margin-top:1px;}
+  .status{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--wait);}
+  .dot.on{background:var(--up);box-shadow:0 0 6px var(--up);}
+  main{max-width:640px;margin:0 auto;padding:12px 12px 60px;}
+  .bar{display:flex;align-items:center;justify-content:space-between;margin:10px 2px 14px;}
+  .bar .label{font-size:12px;color:var(--muted);}
+  .toggle{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);cursor:pointer;user-select:none;}
+  .switch{width:36px;height:20px;border-radius:20px;background:var(--panel2);border:1px solid var(--line);
+    position:relative;transition:.15s;}
+  .switch.on{background:var(--brand);}
+  .switch i{position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:.15s;}
+  .switch.on i{left:18px;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;cursor:pointer;}
+  .card:active{border-color:var(--brand);}
+  .card .sym{font-size:13px;font-weight:600;}
+  .card .px{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--muted);margin-top:2px;}
+  .badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;
+    padding:3px 8px;border-radius:6px;margin-top:8px;}
+  .badge.CALL{background:rgba(38,214,122,.12);color:var(--up);}
+  .badge.PUT{background:rgba(255,77,106,.12);color:var(--down);}
+  .badge.WAIT{background:rgba(74,85,104,.18);color:var(--muted);}
+  .conf{font-size:11px;color:var(--muted);margin-top:6px;}
+  .conf .fill{height:3px;border-radius:3px;background:var(--line);margin-top:3px;overflow:hidden;}
+  .conf .fill i{display:block;height:100%;background:var(--brand);}
+  section h2{font-size:12px;color:var(--muted);text-transform:none;font-weight:600;margin:22px 2px 10px;}
+  .feed{display:flex;flex-direction:column;gap:8px;}
+  .signal{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--wait);
+    border-radius:8px;padding:10px 12px;}
+  .signal.CALL{border-left-color:var(--up);}
+  .signal.PUT{border-left-color:var(--down);}
+  .signal .row{display:flex;justify-content:space-between;align-items:center;}
+  .signal .sym{font-weight:600;font-size:13px;}
+  .signal .dir{font-size:12px;font-weight:700;}
+  .signal .dir.CALL{color:var(--up);}
+  .signal .dir.PUT{color:var(--down);}
+  .signal .meta{font-size:11px;color:var(--muted);margin-top:4px;font-family:'JetBrains Mono',monospace;}
+  .signal .reasons{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.5;}
+  .empty{color:var(--muted);font-size:12px;padding:20px 4px;text-align:center;}
+  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-end;z-index:20;}
+  .modal-bg.open{display:flex;}
+  .modal{background:var(--panel);border-top:1px solid var(--line);border-radius:16px 16px 0 0;
+    width:100%;max-height:80vh;overflow:auto;padding:18px;}
+  .modal h3{margin:0 0 12px;font-size:15px;}
+  .tfrow{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line);font-size:12px;}
+  .tfrow:last-child{border-bottom:none;}
+  .close-x{float:right;color:var(--muted);font-size:20px;line-height:1;cursor:pointer;}
+</style>
+</head>
+<body>
+<header>
+  <img src="./icon-192.png" alt="" />
+  <div>
+    <h1>SEYMUR13 DERIV</h1>
+    <div class="sub">Binar opsion siqnal skaneri</div>
+  </div>
+  <div class="status">
+    <span class="dot" id="dot"></span>
+    <span id="statusText">bağlanır...</span>
+  </div>
+</header>
+
+<main>
+  <div class="bar">
+    <span class="label">Skaner</span>
+    <div class="toggle" id="scannerToggle">
+      <span id="scannerText">yüklənir</span>
+      <div class="switch" id="switchEl"><i></i></div>
+    </div>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+  <section>
+    <h2>Son siqnallar</h2>
+    <div class="feed" id="feed"><div class="empty">Hələ siqnal yoxdur</div></div>
+  </section>
+</main>
+
+<div class="modal-bg" id="modalBg">
+  <div class="modal">
+    <span class="close-x" id="modalClose">×</span>
+    <h3 id="modalTitle">—</h3>
+    <div id="modalBody"></div>
+  </div>
+</div>
+
+<script>
+const API = '';
+const WS_URL = (location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws';
+let symbols = [];
+let adminKey = localStorage.getItem('adminKey') || '';
+
+function connectWS(){
+  const ws = new WebSocket(WS_URL);
+  ws.onopen = () => setDerivStatus(true);
+  ws.onclose = () => { setDerivStatus(false); setTimeout(connectWS, 2000); };
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if(msg.type === 'analysis') updateCard(msg.data);
+    if(msg.type === 'signal') prependSignal(msg.data);
+    if(msg.type === 'state' && typeof msg.data.scannerEnabled === 'boolean') setScanner(msg.data.scannerEnabled);
+  };
+}
+
+function setDerivStatus(on){
+  document.getElementById('dot').classList.toggle('on', on);
+  document.getElementById('statusText').textContent = on ? 'canlı' : 'bağlantı yoxdur';
+}
+
+function setScanner(on){
+  document.getElementById('switchEl').classList.toggle('on', on);
+  document.getElementById('scannerText').textContent = on ? 'aktiv' : 'dayandırılıb';
+}
+
+document.getElementById('scannerToggle').onclick = async () => {
+  const on = !document.getElementById('switchEl').classList.contains('on');
+  if(!adminKey){
+    adminKey = prompt('Admin key daxil et (server ADMIN_API_KEY dəyəri):') || '';
+    localStorage.setItem('adminKey', adminKey);
+  }
+  const r = await fetch(`${API}/api/scanner`, {
+    method:'POST', headers:{'content-type':'application/json','x-admin-key':adminKey},
+    body: JSON.stringify({enabled:on})
+  });
+  if(r.ok){ const j = await r.json(); setScanner(j.scannerEnabled); }
+  else alert('Xəta: admin key yanlış ola bilər');
+};
+
+function badgeClass(dir){ return dir === 'CALL' ? 'CALL' : dir === 'PUT' ? 'PUT' : 'WAIT'; }
+function dirLabel(dir){ return dir === 'CALL' ? '▲ CALL' : dir === 'PUT' ? '▼ PUT' : 'GÖZLƏ'; }
+
+function ensureCard(sym){
+  let el = document.getElementById('card-'+sym);
+  if(el) return el;
+  el = document.createElement('div');
+  el.className = 'card'; el.id = 'card-'+sym;
+  el.onclick = () => openModal(sym);
+  el.innerHTML = `<div class="sym">${sym}</div><div class="px mono">--</div>
+    <div class="badge WAIT">GÖZLƏ</div>
+    <div class="conf">0% <div class="fill"><i style="width:0%"></i></div></div>`;
+  document.getElementById('grid').appendChild(el);
+  return el;
+}
+
+function updateCard(r){
+  const el = ensureCard(r.symbol);
+  el.querySelector('.px').textContent = r.price != null ? Number(r.price).toLocaleString('en-US',{maximumFractionDigits:5}) : '--';
+  const b = el.querySelector('.badge');
+  b.className = 'badge ' + badgeClass(r.dir);
+  b.textContent = dirLabel(r.dir);
+  el.querySelector('.conf').firstChild.textContent = (r.confidence||0) + '% ';
+  el.querySelector('.conf .fill i').style.width = (r.confidence||0) + '%';
+  el.dataset.full = JSON.stringify(r);
+}
+
+function prependSignal(s){
+  const feed = document.getElementById('feed');
+  if(feed.querySelector('.empty')) feed.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'signal ' + badgeClass(s.dir);
+  const t = new Date(s.ts).toLocaleTimeString('az-AZ',{hour:'2-digit',minute:'2-digit'});
+  div.innerHTML = `<div class="row"><span class="sym">${s.symbol}</span><span class="dir ${s.dir}">${dirLabel(s.dir)}</span></div>
+    <div class="meta">${t} · etibar ${s.confidence}% · expiry ${s.expiry==='5m'?'5 dəq':'1 dəq'} · ${Number(s.price).toLocaleString('en-US',{maximumFractionDigits:5})}</div>
+    <div class="reasons">${(s.reasons||[]).join(' · ')}</div>`;
+  feed.prepend(div);
+  while(feed.children.length > 30) feed.removeChild(feed.lastChild);
+}
+
+function openModal(sym){
+  const el = document.getElementById('card-'+sym);
+  const r = el.dataset.full ? JSON.parse(el.dataset.full) : null;
+  document.getElementById('modalTitle').textContent = sym;
+  const body = document.getElementById('modalBody');
+  if(!r){ body.innerHTML = '<div class="empty">Hələ analiz yoxdur</div>'; }
+  else{
+    const tfRows = Object.entries(r.timeframes||{}).map(([tf,v]) => v ? `
+      <div class="tfrow"><span>${tf}</span><span>${v.signal} · ${v.confidence}%</span></div>` : '').join('');
+    body.innerHTML = `
+      <div class="tfrow"><span>Son qərar</span><span>${dirLabel(r.dir)} · ${r.confidence}%</span></div>
+      <div class="tfrow"><span>Güc</span><span>${r.strength||'--'}</span></div>
+      ${tfRows}
+      <div class="reasons" style="margin-top:10px">${(r.reasons||[]).join(' · ')}</div>`;
+  }
+  document.getElementById('modalBg').classList.add('open');
+}
+document.getElementById('modalClose').onclick = () => document.getElementById('modalBg').classList.remove('open');
+document.getElementById('modalBg').onclick = (e) => { if(e.target.id==='modalBg') e.target.classList.remove('open'); };
+
+async function loadState(){
+  const s = await fetch(`${API}/api/state`).then(r=>r.json());
+  symbols = s.symbols || [];
+  setScanner(s.scannerEnabled);
+  setDerivStatus(s.derivConnected);
+  symbols.forEach(ensureCard);
+  Object.values(s.analysis||{}).forEach(updateCard);
+  const feed = document.getElementById('feed');
+  if((s.signals||[]).length){
+    feed.innerHTML = '';
+    [...s.signals].reverse().forEach(prependSignal);
+  }
+}
+
+if('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(()=>{});
+loadState();
+connectWS();
+setInterval(loadState, 15000);
+</script>
+</body>
+</html>
