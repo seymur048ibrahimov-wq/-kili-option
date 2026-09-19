@@ -11,6 +11,7 @@ const PORT = Number(process.env.PORT || 8788);
 // === Deriv bağlantısı ===
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
 const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN || '';
+const DERIV_STAKE_AMOUNT = Number(process.env.DERIV_STAKE_AMOUNT || 1);
 // Əvvəl yeni public endpoint, alınmasa köhnə endpoint (avtomatik növbələnir)
 const DERIV_WS_URLS = process.env.DERIV_WS_URL
   ? [process.env.DERIV_WS_URL]
@@ -52,6 +53,7 @@ const state = {
   lastAnalysis: new Map(),
   signals: [],
   lastSignalAt: new Map(),
+  pendingDir: new Map(),
   clients: new Set(),
   activeSymbols: symbols.slice(),
   availableSymbols: [],
@@ -212,7 +214,12 @@ function analyze(c){
   }
   // ADX<15 = yan/trendsiz bazar → bu şəraitdə əksər trend indikatorları aldadıcı siqnal verir,
   // ona görə MIN_CONFIDENCE-dan asılı olmayaraq siqnalı tam bloklayırıq (yalan siqnalların əsas mənbəyi budur)
-  const signal=(ax!=null&&ax<15)?'WAIT':(score>=5?'LONG':score<=-5?'SHORT':'WAIT');
+  let signal=(ax!=null&&ax<15)?'WAIT':(score>=5?'LONG':score<=-5?'SHORT':'WAIT');
+  // Spike filtri: sintetik indekslərdə (xüsusən Boom/Crash/Jump) tək şamda ATR-dən 3+ dəfə
+  // böyük hərəkət baş verə bilər — bu zaman indikatorlar etibarsızdır, siqnal bloklanır
+  const lastBar=c.at(-1), barRange=lastBar.h-lastBar.l;
+  const isSpike = av!=null && barRange > av*3;
+  if (isSpike) { signal='WAIT'; reasons.push('Qeyri-adi sıçrayış (spike) aşkarlandı — bloklandı'); }
   return{signal,confidence,score,price,atr:av,rsi:rv,adx:ax,reasons};
 }
 
@@ -426,6 +433,88 @@ function tfFromGranularity(g) {
   return null;
 }
 
+// === Trading bağlantısı (Telegram "AL/Bağla" düymələri üçün, market-data socketindən ayrı) ===
+let tradingWs = null;
+let tradingAuthorized = false;
+let tradingCurrency = null;
+let tradingIsVirtual = null;
+let tradingReconnectDelay = 3000;
+let tradingReqSeq = 1;
+const tradingPending = new Map(); // req_id -> { resolve, reject, timer }
+
+function connectTradingWs() {
+  if (!DERIV_API_TOKEN) { console.log('[trading] DERIV_API_TOKEN boşdur — Telegram AL/Bağla düymələri deaktiv olacaq'); return; }
+  const ws = new WebSocket(DERIV_WS_URLS[0]);
+  tradingWs = ws;
+  ws.on('open', () => {
+    tradingReconnectDelay = 3000;
+    ws.send(JSON.stringify({ authorize: DERIV_API_TOKEN, req_id: tradingReqSeq++ }));
+  });
+  ws.on('message', (raw) => {
+    let msg; try { msg = JSON.parse(raw); } catch { return; }
+    if (msg.msg_type === 'authorize') {
+      if (msg.error) { console.error('[trading] avtorizasiya xətası:', msg.error.message); tradingAuthorized = false; return; }
+      tradingAuthorized = true;
+      tradingCurrency = msg.authorize.currency;
+      tradingIsVirtual = !!msg.authorize.is_virtual;
+      console.log(`[trading] avtorizasiya OK — ${msg.authorize.loginid} (${tradingIsVirtual ? 'DEMO' : 'REAL'}), valyuta: ${tradingCurrency}`);
+    }
+    if (msg.req_id && tradingPending.has(msg.req_id)) {
+      const p = tradingPending.get(msg.req_id);
+      tradingPending.delete(msg.req_id);
+      clearTimeout(p.timer);
+      if (msg.error) p.reject(new Error(msg.error.message));
+      else p.resolve(msg);
+    }
+  });
+  ws.on('close', () => {
+    tradingAuthorized = false;
+    console.log(`[trading] bağlantı kəsildi, ${Math.round(tradingReconnectDelay / 1000)}s sonra yenidən qoşulacaq`);
+    setTimeout(connectTradingWs, tradingReconnectDelay);
+    tradingReconnectDelay = Math.min(tradingReconnectDelay * 2, 30000);
+  });
+  ws.on('error', (e) => console.error('[trading] ws xətası:', e.message));
+}
+
+function tradingRequest(payload, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    if (!tradingWs || tradingWs.readyState !== WebSocket.OPEN || !tradingAuthorized) {
+      return reject(new Error('Trading bağlantısı hazır deyil, bir az sonra yenidən cəhd edin'));
+    }
+    const req_id = tradingReqSeq++;
+    const timer = setTimeout(() => { tradingPending.delete(req_id); reject(new Error('Deriv-dən cavab gəlmədi (timeout)')); }, timeoutMs);
+    tradingPending.set(req_id, { resolve, reject, timer });
+    tradingWs.send(JSON.stringify({ ...payload, req_id }));
+  });
+}
+
+async function buyContract(symbol, dir, durationMin) {
+  const msg = await tradingRequest({
+    buy: '1',
+    price: DERIV_STAKE_AMOUNT,
+    parameters: {
+      amount: DERIV_STAKE_AMOUNT,
+      basis: 'stake',
+      contract_type: dir,
+      currency: tradingCurrency || 'USD',
+      duration: durationMin,
+      duration_unit: 'm',
+      symbol,
+    },
+  });
+  return msg.buy;
+}
+
+async function sellContract(contractId) {
+  const msg = await tradingRequest({ sell: contractId, price: 0 });
+  return msg.sell;
+}
+
+function expiryMinutes(expiry) {
+  const m = /^(\d+)/.exec(expiry || '');
+  return m ? Number(m[1]) : 15;
+}
+
 // Watchdog: WS "açıq" görünsə də Deriv bəzən data axınını səssizcə kəsir.
 // 90 saniyə heç bir yeni şam gəlməzsə, bağlantını məcburi bağlayıb yenidən qururuq.
 setInterval(() => {
@@ -453,7 +542,17 @@ function runAnalysis(symbol) {
   broadcast({ type: 'analysis', data: r });
 
   if (!state.scannerEnabled) return;
-  if (r.dir === 'WAIT' || r.confidence < MIN_CONFIDENCE) return;
+  if (r.dir === 'WAIT' || r.confidence < MIN_CONFIDENCE) { state.pendingDir.delete(symbol); return; }
+
+  // Ən azı 2 ardıcıl analiz eyni istiqaməti təsdiqləməlidir — tək tiklik "yanlış sıçrayış"
+  // (qiymətin bir anlıq irəli-geri hərəkəti) siqnal doğurmasın deyə
+  const pend = state.pendingDir.get(symbol);
+  if (!pend || pend.dir !== r.dir) {
+    state.pendingDir.set(symbol, { dir: r.dir, count: 1 });
+    return;
+  }
+  pend.count++;
+  if (pend.count < 2) return;
 
   const prev = state.lastSignalAt.get(symbol);
   const cooldownMs = SIGNAL_COOLDOWN_MIN * 60 * 1000;
@@ -506,20 +605,81 @@ async function sendTelegramSignal(r) {
   const dirText = r.dir === 'CALL' ? 'CALL (yuxarı)' : 'PUT (aşağı)';
   const expText = r.expiry === '15m' ? '15 dəqiqə' : '5 dəqiqə';
   const confluenceText = r.confluence != null ? ` — 🟢${r.confluence}/3` : '';
+  const autoTradeNote = DERIV_API_TOKEN
+    ? '<i>Aşağıdakı düymə ilə bir kliklə Deriv-də əməliyyat açıla bilər.</i>'
+    : '<i>Bu avtomatik texniki siqnaldır, maliyyə məsləhəti deyil. Auto-trade hələ aktiv deyil.</i>';
   const lines = [
     `${emoji} <b>${r.symbol}</b> — <b>${dirText}</b>${confluenceText}`,
     `Tövsiyə olunan expiry: <b>${expText}</b> (${r.strength})`,
     `Etibar: <b>${r.confidence}%</b> ${confBar(r.confidence)}`,
     `Qiymət: <code>${fmt(r.price)}</code>`,
     `Səbəblər: ${r.reasons.join(', ')}`,
-    `<i>Bu avtomatik texniki siqnaldır, maliyyə məsləhəti deyil. Auto-trade hələ aktiv deyil.</i>`,
+    autoTradeNote,
   ];
-  await telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: lines.join('\n'), parse_mode: 'HTML' });
+  const btnText = r.dir === 'CALL' ? '🟢 AL (CALL)' : '🔴 SAT (PUT)';
+  const reply_markup = DERIV_API_TOKEN
+    ? { inline_keyboard: [[{ text: btnText, callback_data: `B|${r.symbol}|${r.dir}|${expiryMinutes(r.expiry)}` }]] }
+    : undefined;
+  await telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: lines.join('\n'), parse_mode: 'HTML', reply_markup });
 }
 
 function broadcast(msg) {
   const s = JSON.stringify(msg);
   for (const c of state.clients) { if (c.readyState === 1) c.send(s); }
+}
+
+// === Telegram düymə (callback_query) emalı ===
+async function handleCallbackQuery(cq) {
+  const data = cq.data || '';
+  const chatId = cq.message.chat.id;
+  const messageId = cq.message.message_id;
+  const baseText = cq.message.text || '';
+  try {
+    if (data.startsWith('B|')) {
+      const [, symbol, dir, durStr] = data.split('|');
+      const durMin = Number(durStr) || 15;
+      if (!DERIV_API_TOKEN) throw new Error('DERIV_API_TOKEN qurulmayıb');
+      if (!tradingAuthorized) throw new Error('Trading bağlantısı hazır deyil, bir az gözləyin');
+      await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: '⏳ Sifariş göndərilir...' });
+      const buy = await buyContract(symbol, dir, durMin);
+      const acc = tradingIsVirtual ? 'DEMO' : 'REAL';
+      const closeBtn = { inline_keyboard: [[{ text: '🔴 Bağla (indi sat)', callback_data: `S|${buy.contract_id}` }]] };
+      await telegram('editMessageText', {
+        chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
+        text: `${baseText}\n\n✅ <b>ALINDI (${acc})</b> — stake: ${DERIV_STAKE_AMOUNT} ${tradingCurrency || ''} · #${buy.contract_id}`,
+        reply_markup: closeBtn,
+      });
+    } else if (data.startsWith('S|')) {
+      const contractId = data.split('|')[1];
+      await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: '⏳ Bağlanır...' });
+      const sell = await sellContract(contractId);
+      await telegram('editMessageText', {
+        chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
+        text: `${baseText}\n\n🔒 <b>BAĞLANDI</b> — satış: ${sell.sold_for} ${tradingCurrency || ''}`,
+      });
+    }
+  } catch (e) {
+    console.error('[telegram] callback xətası:', e.message);
+    await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: `❌ Xəta: ${e.message}`, show_alert: true });
+  }
+}
+
+let tgUpdateOffset = 0;
+async function pollTelegramUpdates() {
+  if (!TELEGRAM_TOKEN) return;
+  try {
+    const res = await telegram('getUpdates', { offset: tgUpdateOffset, timeout: 25, allowed_updates: ['callback_query'] });
+    if (res && res.ok && Array.isArray(res.result)) {
+      for (const upd of res.result) {
+        tgUpdateOffset = upd.update_id + 1;
+        if (upd.callback_query) await handleCallbackQuery(upd.callback_query);
+      }
+    }
+  } catch (e) {
+    console.error('[telegram] polling xətası:', e.message);
+  } finally {
+    setTimeout(pollTelegramUpdates, 500);
+  }
 }
 
 const app = express();
@@ -599,4 +759,6 @@ async function verifyTelegramOnBoot() {
 
 loadState();
 connectDeriv();
+connectTradingWs();
+pollTelegramUpdates();
 verifyTelegramOnBoot();
