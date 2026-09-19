@@ -38,8 +38,9 @@ const symbols = rawSyms ? rawSyms.split(',').map(s => s.trim()).filter(Boolean) 
 
 const TIMEFRAMES = ['15m'];
 const TREND_TF = '1h';
-const GRANULARITY = { '15m': 900, '1h': 3600 };
-const ALL_TFS = [...TIMEFRAMES, TREND_TF];
+const CONFIRM_TF = '5m';
+const GRANULARITY = { '5m': 300, '15m': 900, '1h': 3600 };
+const ALL_TFS = [CONFIRM_TF, ...TIMEFRAMES, TREND_TF];
 
 function key(symbol, tf) { return `${symbol}|${tf}`; }
 
@@ -61,7 +62,7 @@ function saveState() {
     signals: state.signals.slice(-200),
     lastSignalAt: [...state.lastSignalAt.entries()],
   };
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(dump)); } catch (e) {}
+  fs.writeFile(STATE_FILE, JSON.stringify(dump), (e) => { if (e) console.error('[state] yazma xətası:', e.message); });
 }
 function loadState() {
   try {
@@ -135,10 +136,54 @@ function fibLevels(c){
   const n=Math.min(c.length,50),s=c.slice(-n),hi=Math.max(...s.map(x=>x.h)),lo=Math.min(...s.map(x=>x.l)),diff=hi-lo;
   return{hi,lo,r382:hi-diff*0.382,r500:hi-diff*0.5,r618:hi-diff*0.618};
 }
+function williamsR(c,p=14){
+  if(c.length<p)return null;
+  const x=c.slice(-p),hh=Math.max(...x.map(z=>z.h)),ll=Math.min(...x.map(z=>z.l));
+  return hh===ll?-50:((hh-x.at(-1).c)/(hh-ll))*-100;
+}
+function keltnerChannel(c,close,p=20,mult=2){
+  if(c.length<p||close.length<p)return null;
+  const mid=ema(close.slice(-p),p);
+  const av=atr(c,p);
+  if(mid==null||av==null)return null;
+  return{mid,upper:mid+mult*av,lower:mid-mult*av};
+}
+function heikinAshiTrend(c,n=5){
+  if(c.length<n+1)return 0;
+  let haO=(c[0].o+c[0].c)/2, haC=(c[0].o+c[0].h+c[0].l+c[0].c)/4;
+  let up=0,down=0;
+  for(let i=1;i<c.length;i++){
+    const newHaC=(c[i].o+c[i].h+c[i].l+c[i].c)/4;
+    const newHaO=(haO+haC)/2;
+    haO=newHaO; haC=newHaC;
+    if(i>=c.length-n){ if(haC>haO) up++; else if(haC<haO) down++; }
+  }
+  return up>down?1:down>up?-1:0;
+}
+function superTrend(c,p=10,mult=3){
+  if(c.length<p+1)return null;
+  let trend=true, finalUpper=null, finalLower=null;
+  const start=Math.max(1,c.length-60);
+  for(let i=start;i<c.length;i++){
+    const av=atr(c.slice(0,i+1),p);
+    if(av==null)continue;
+    const hl2=(c[i].h+c[i].l)/2;
+    let upperBand=hl2+mult*av, lowerBand=hl2-mult*av;
+    if(finalUpper==null){finalUpper=upperBand;finalLower=lowerBand;}
+    else{
+      upperBand=(upperBand<finalUpper||c[i-1].c>finalUpper)?upperBand:finalUpper;
+      lowerBand=(lowerBand>finalLower||c[i-1].c<finalLower)?lowerBand:finalLower;
+      finalUpper=upperBand; finalLower=lowerBand;
+    }
+    if(trend&&c[i].c<finalLower)trend=false;
+    else if(!trend&&c[i].c>finalUpper)trend=true;
+  }
+  return{uptrend:trend};
+}
 
 function analyze(c){
   if(c.length<60)return null;
-  const close=c.map(x=>x.c),price=close.at(-1),e9=ema(close,9),e21=ema(close,21),e50=ema(close,50),e200=ema(close,200),rv=rsi(close),mv=macd(close),bb=bollinger(close),st=stochastic(c),av=atr(c),cv=cci(c),str=structure(c),ax=adx(c),ich=ichimoku(c),psar=parabolicSar(c),piv=pivotPoints(c),fib=fibLevels(c);
+  const close=c.map(x=>x.c),price=close.at(-1),e9=ema(close,9),e21=ema(close,21),e50=ema(close,50),e200=ema(close,200),rv=rsi(close),mv=macd(close),bb=bollinger(close),st=stochastic(c),av=atr(c),cv=cci(c),str=structure(c),ax=adx(c),ich=ichimoku(c),psar=parabolicSar(c),piv=pivotPoints(c),fib=fibLevels(c),wr=williamsR(c),kelt=keltnerChannel(c,close),ha=heikinAshiTrend(c),stnd=superTrend(c);
   // QEYD: OBV/MFI/VWAP HESABLANMIR — Deriv sintetik indekslərində real "volume" yoxdur
   // (aşağıda hər şam üçün v:1 sabit qoyulur), ona görə bu indikatorlar burda mənasız/aldadıcı
   // olardı və score-a əlavə "sanki-güvən" verərdi. OKX kripto versiyasında (real hədcm datası ilə)
@@ -156,39 +201,48 @@ function analyze(c){
   if(psar){if(psar.uptrend){score+=1;reasons.push('Parabolic SAR yüksəliş');}else{score-=1;reasons.push('Parabolic SAR düşüş');}}
   if(piv){if(price>piv.pp){score+=1;reasons.push('Pivot üzərində');}else if(price<piv.pp){score-=1;reasons.push('Pivot altında');}}
   if(fib){if(price>fib.r500){score+=1;reasons.push('Fib 50% üzərində');}else{score-=1;reasons.push('Fib 50% altında');}}
-  let confidence=Math.round(Math.min(100,Math.abs(score)/12*100));
+  if(wr!=null){if(wr<-80){score+=1;reasons.push('Williams %R oversold');}else if(wr>-20){score-=1;reasons.push('Williams %R overbought');}}
+  if(kelt){if(price<=kelt.lower){score+=1;reasons.push('Keltner alt zolaq');}else if(price>=kelt.upper){score-=1;reasons.push('Keltner üst zolaq');}}
+  if(ha!==0){if(ha>0){score+=1;reasons.push('Heikin-Ashi yüksəliş');}else{score-=1;reasons.push('Heikin-Ashi düşüş');}}
+  if(stnd){if(stnd.uptrend){score+=1;reasons.push('SuperTrend yüksəliş');}else{score-=1;reasons.push('SuperTrend düşüş');}}
+  let confidence=Math.round(Math.min(100,Math.abs(score)/16*100));
   if(ax!=null){
     if(ax>=25){confidence=Math.min(100,confidence+8);reasons.push(`ADX güclü trend (${ax.toFixed(0)})`);}
     else if(ax<15){confidence=Math.max(0,confidence-12);reasons.push(`ADX zəif/yan bazar (${ax.toFixed(0)})`);}
   }
-  const signal=score>=4?'LONG':score<=-4?'SHORT':'WAIT';
+  // ADX<15 = yan/trendsiz bazar → bu şəraitdə əksər trend indikatorları aldadıcı siqnal verir,
+  // ona görə MIN_CONFIDENCE-dan asılı olmayaraq siqnalı tam bloklayırıq (yalan siqnalların əsas mənbəyi budur)
+  const signal=(ax!=null&&ax<15)?'WAIT':(score>=5?'LONG':score<=-5?'SHORT':'WAIT');
   return{signal,confidence,score,price,atr:av,rsi:rv,adx:ax,reasons};
 }
 
 function fullAnalysis(symbol){
   const a = {};
   for (const tf of ALL_TFS) a[tf] = analyze(getCandles(symbol, tf));
-  const m15 = a['15m'], h1 = a[TREND_TF];
+  const m5 = a[CONFIRM_TF], m15 = a['15m'], h1 = a[TREND_TF];
   if (!m15) return null;
 
   let final = 'WAIT', expiry = null, strength = 'zəif';
   let confluence = 0;
   if (m15.signal !== 'WAIT') confluence++;
   if (h1 && h1.signal === m15.signal) confluence++;
+  if (m5 && m5.signal === m15.signal) confluence++;
 
   if (h1 && m15.signal !== 'WAIT' && m15.signal === h1.signal) {
-    final = m15.signal; expiry = '15m'; strength = 'güclü (15m+1h trend uyğun)';
+    final = m15.signal; expiry = '15m';
+    strength = (m5 && m5.signal === final) ? 'çox güclü (5m+15m+1h uyğun)' : 'güclü (15m+1h trend uyğun)';
   }
 
   let confidence = m15.confidence;
   if (final !== 'WAIT') {
-    const parts = [m15.confidence, h1?.confidence].filter(x => x != null);
+    const parts = [m15.confidence, h1?.confidence, (m5 && m5.signal === final) ? m5.confidence : null].filter(x => x != null);
     confidence = Math.round(parts.reduce((s, x) => s + x, 0) / parts.length);
     if (h1 && h1.signal === final) confidence = Math.min(100, confidence + 6);
+    if (m5 && m5.signal === final) confidence = Math.min(100, confidence + 4);
   }
 
   const dir = final === 'LONG' ? 'CALL' : final === 'SHORT' ? 'PUT' : 'WAIT';
-  const reasons = [...new Set([...(m15?.reasons||[]), ...(h1?.reasons||[])])].slice(0, 6);
+  const reasons = [...new Set([...(m5?.reasons||[]), ...(m15?.reasons||[]), ...(h1?.reasons||[])])].slice(0, 6);
   return { symbol, dir, confidence, expiry, strength, confluence, price: m15.price, atr: m15.atr, rsi: m15.rsi, timeframes: a, reasons };
 }
 
@@ -198,6 +252,9 @@ let derivWs = null;
 let reqSeq = 1;
 let pingTimer = null;
 let reconnectTimer = null;
+let reconnectDelay = 3000;
+const MAX_RECONNECT_DELAY = 30000;
+let lastAnyCandleAt = Date.now();
 // req_id -> { symbol, tf }  (yeni Deriv API cavabda echo_req qaytarmaya bilər)
 const reqMeta = new Map();
 // subscription.id -> { symbol, tf }
@@ -229,6 +286,7 @@ function connectDeriv() {
   ws.on('open', () => {
     opened = true;
     state.derivConnected = true;
+    reconnectDelay = 3000;
     console.log('[deriv] bağlantı quruldu, aktiv simvollar soruşulur...');
     ws.send(JSON.stringify({ active_symbols: 'brief', req_id: reqSeq++ }));
     // Deriv boş qalan bağlantını bağlayır — hər 30 san ping
@@ -339,6 +397,7 @@ function connectDeriv() {
       const o = msg.ohlc;
       const meta = resolveMeta(msg, o.granularity, o.symbol || o.underlying_symbol);
       if (!meta) return;
+      lastAnyCandleAt = Date.now();
       const { symbol, tf } = meta;
       const arr = state.candles.get(key(symbol, tf)) || [];
       const epochMs = Number(o.open_time) * 1000;
@@ -355,8 +414,10 @@ function connectDeriv() {
     state.derivConnected = false;
     clearInterval(pingTimer);
     if (!opened && DERIV_WS_URLS.length > 1) urlIdx++;
-    console.log('[deriv] bağlantı kəsildi, 3 saniyə sonra yenidən qoşulacaq');
-    if (!reconnectTimer) reconnectTimer = setTimeout(connectDeriv, 3000);
+    const delay = reconnectDelay;
+    console.log(`[deriv] bağlantı kəsildi, ${Math.round(delay / 1000)} saniyə sonra yenidən qoşulacaq`);
+    if (!reconnectTimer) reconnectTimer = setTimeout(connectDeriv, delay);
+    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
   });
   ws.on('error', (e) => console.error('[deriv] WS xətası:', e.message));
 }
@@ -364,6 +425,15 @@ function tfFromGranularity(g) {
   for (const tf of Object.keys(GRANULARITY)) if (GRANULARITY[tf] === Number(g)) return tf;
   return null;
 }
+
+// Watchdog: WS "açıq" görünsə də Deriv bəzən data axınını səssizcə kəsir.
+// 90 saniyə heç bir yeni şam gəlməzsə, bağlantını məcburi bağlayıb yenidən qururuq.
+setInterval(() => {
+  if (state.derivConnected && Date.now() - lastAnyCandleAt > 90000) {
+    console.warn('[deriv] 90 saniyədir yeni şam gəlmir, bağlantı yenidən qurulur');
+    try { derivWs && derivWs.close(); } catch {}
+  }
+}, 15000);
 
 let analysisTimers = new Map();
 function onCandleUpdate(symbol) {
@@ -435,7 +505,7 @@ async function sendTelegramSignal(r) {
   const emoji = r.dir === 'CALL' ? '📈' : '📉';
   const dirText = r.dir === 'CALL' ? 'CALL (yuxarı)' : 'PUT (aşağı)';
   const expText = r.expiry === '15m' ? '15 dəqiqə' : '5 dəqiqə';
-  const confluenceText = r.confluence != null ? ` — 🟢${r.confluence}/2` : '';
+  const confluenceText = r.confluence != null ? ` — 🟢${r.confluence}/3` : '';
   const lines = [
     `${emoji} <b>${r.symbol}</b> — <b>${dirText}</b>${confluenceText}`,
     `Tövsiyə olunan expiry: <b>${expText}</b> (${r.strength})`,
@@ -474,12 +544,17 @@ app.get('/api/state', (req, res) => {
   });
 });
 app.get('/api/analyze/:sym', (req, res) => {
-  const r = state.lastAnalysis.get(req.params.sym) || fullAnalysis(req.params.sym);
+  const sym = req.params.sym;
+  if (!state.activeSymbols.includes(sym)) return res.status(400).json({ error: 'yanlış simvol' });
+  const r = state.lastAnalysis.get(sym) || fullAnalysis(sym);
   if (!r) return res.status(404).json({ error: 'kifayət qədər data yoxdur' });
   res.json(r);
 });
 app.get('/api/candles/:sym/:tf', (req, res) => {
-  res.json(getCandles(req.params.sym, req.params.tf));
+  const { sym, tf } = req.params;
+  if (!state.activeSymbols.includes(sym)) return res.status(400).json({ error: 'yanlış simvol' });
+  if (!GRANULARITY[tf]) return res.status(400).json({ error: 'yanlış timeframe' });
+  res.json(getCandles(sym, tf));
 });
 app.post('/api/scanner', requireAdmin, (req, res) => {
   state.scannerEnabled = !!req.body.enabled;
