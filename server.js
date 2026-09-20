@@ -457,10 +457,12 @@ async function derivRest(method, path, body) {
     },
     body: body ? JSON.stringify(body) : undefined,
   });
-  let json; try { json = await res.json(); } catch { json = null; }
+  const rawText = await res.text();
+  let json; try { json = rawText ? JSON.parse(rawText) : null; } catch { json = null; }
   if (!res.ok) {
     const err = json?.errors?.[0];
-    throw new Error(err ? `${err.code}: ${err.message || ''}`.trim() : `HTTP ${res.status}`);
+    const detail = err ? `${err.code}: ${err.message || ''}`.trim() : (rawText ? rawText.slice(0, 200) : res.statusText || '');
+    throw new Error(`HTTP ${res.status} (${path}) — ${detail}`);
   }
   return json;
 }
@@ -823,7 +825,7 @@ async function reportTradingStatusOnBoot() {
   } else {
     await telegram('sendMessage', {
       chat_id: TELEGRAM_CHAT_ID,
-      text: `❌ Trading qoşulması uğursuz oldu: ${tradingAuthError || '20 saniyədə heç bir cavab gəlmədi'}\n\nDERIV_APP_ID: ${DERIV_APP_ID} (token uzunluğu: ${DERIV_API_TOKEN.length}).\nDiqqət: Deriv yeni sistemində DERIV_APP_ID developers.deriv.com Dashboard-da qeydiyyatdan keçirdiyiniz tətbiqin ID-si olmalıdır, köhnə ümumi 1089 işləməyə bilər.`,
+      text: `❌ Trading qoşulması uğursuz oldu: ${tradingAuthError || '20 saniyədə heç bir cavab gəlmədi'}\n\nDERIV_APP_ID: ${DERIV_APP_ID} (token uzunluğu: ${DERIV_API_TOKEN.length}).`,
     });
   }
 }
