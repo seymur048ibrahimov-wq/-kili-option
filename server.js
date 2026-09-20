@@ -492,11 +492,16 @@ async function connectTradingWs() {
 
     const ws = new WebSocket(otpUrl);
     tradingWs = ws;
+    let tradingPingTimer = null;
     ws.on('open', () => {
       tradingReconnectDelay = 3000;
       tradingAuthError = null;
       tradingAuthorized = true;
       console.log(`[trading] qoşuldu — hesab: ${tradingAccountId} (${tradingIsVirtual ? 'DEMO' : 'REAL'}), valyuta: ${tradingCurrency}`);
+      clearInterval(tradingPingTimer);
+      tradingPingTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ping: 1 }));
+      }, 30000);
     });
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw); } catch { return; }
@@ -510,6 +515,7 @@ async function connectTradingWs() {
     });
     ws.on('close', (code) => {
       tradingAuthorized = false;
+      clearInterval(tradingPingTimer);
       console.log(`[trading] bağlantı kəsildi (kod ${code}), ${Math.round(tradingReconnectDelay / 1000)}s sonra yenidən qoşulacaq`);
       setTimeout(connectTradingWs, tradingReconnectDelay);
       tradingReconnectDelay = Math.min(tradingReconnectDelay * 2, 30000);
