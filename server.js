@@ -10,7 +10,7 @@ const PORT = Number(process.env.PORT || 8788);
 
 // === Deriv bağlantısı ===
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
-const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN || '';
+const DERIV_API_TOKEN = (process.env.DERIV_API_TOKEN || '').trim();
 const DERIV_STAKE_AMOUNT = Number(process.env.DERIV_STAKE_AMOUNT || 1);
 // "public" endpoint yalnız bazar məlumatı üçündür, authorize/buy dəstəkləmir —
 // trading üçün həmişə rəsmi, tam funksiyalı endpoint istifadə olunur
@@ -773,6 +773,7 @@ async function reportTradingStatusOnBoot() {
     await telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: 'ℹ️ DERIV_API_TOKEN qurulmayıb — AL/Bağla düymələri deaktiv olacaq.' });
     return;
   }
+  console.log(`[trading] DERIV_API_TOKEN uzunluğu: ${DERIV_API_TOKEN.length} simvol`);
   // authorize cavabı gəlməsi üçün, nəticə bəlli olana qədər (max 20san) yoxlayırıq
   for (let i = 0; i < 10; i++) {
     if (tradingAuthorized || tradingAuthError) break;
@@ -787,7 +788,7 @@ async function reportTradingStatusOnBoot() {
   } else {
     await telegram('sendMessage', {
       chat_id: TELEGRAM_CHAT_ID,
-      text: `❌ Trading avtorizasiyası uğursuz oldu: ${tradingAuthError || '20 saniyədə heç bir cavab gəlmədi'}. Token-i yoxlayın (Trade icazəsi işarələnməlidir).`,
+      text: `❌ Trading avtorizasiyası uğursuz oldu: ${tradingAuthError || '20 saniyədə heç bir cavab gəlmədi'} (token uzunluğu: ${DERIV_API_TOKEN.length} simvol). Token-i yoxlayın (Trade icazəsi işarələnməlidir).`,
     });
   }
 }
