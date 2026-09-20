@@ -12,9 +12,6 @@ const PORT = Number(process.env.PORT || 8788);
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
 const DERIV_API_TOKEN = (process.env.DERIV_API_TOKEN || '').trim();
 const DERIV_STAKE_AMOUNT = Number(process.env.DERIV_STAKE_AMOUNT || 1);
-// "public" endpoint yalnız bazar məlumatı üçündür, authorize/buy dəstəkləmir —
-// trading üçün həmişə rəsmi, tam funksiyalı endpoint istifadə olunur
-const DERIV_TRADING_WS_URL = process.env.DERIV_TRADING_WS_URL || `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
 // Əvvəl yeni public endpoint, alınmasa köhnə endpoint (avtomatik növbələnir)
 const DERIV_WS_URLS = process.env.DERIV_WS_URL
   ? [process.env.DERIV_WS_URL]
@@ -436,63 +433,100 @@ function tfFromGranularity(g) {
   return null;
 }
 
-// === Trading bağlantısı (Telegram "AL/Bağla" düymələri üçün, market-data socketindən ayrı) ===
+// === Trading bağlantısı (Telegram "AL/Bağla" düymələri üçün) ===
+// QEYD: Deriv 2026-da API arxitekturasını dəyişib — köhnə "birbaşa WS-də authorize"
+// üsulu artıq işləmir. Yeni axın: REST ilə hesabı tap → OTP al → OTP-li WS URL-ə qoşul.
+const DERIV_REST_BASE = 'https://api.derivws.com';
 let tradingWs = null;
 let tradingAuthorized = false;
 let tradingAuthError = null;
 let tradingCurrency = null;
 let tradingIsVirtual = null;
+let tradingAccountId = null;
 let tradingReconnectDelay = 3000;
 let tradingReqSeq = 1;
 const tradingPending = new Map(); // req_id -> { resolve, reject, timer }
 
-function connectTradingWs() {
-  if (!DERIV_API_TOKEN) { console.log('[trading] DERIV_API_TOKEN boşdur — Telegram AL/Bağla düymələri deaktiv olacaq'); return; }
-  const ws = new WebSocket(DERIV_TRADING_WS_URL);
-  tradingWs = ws;
-  let opened = false;
-  ws.on('open', () => {
-    opened = true;
-    tradingReconnectDelay = 3000;
-    ws.send(JSON.stringify({ authorize: DERIV_API_TOKEN, req_id: tradingReqSeq++ }));
+async function derivRest(method, path, body) {
+  const res = await fetch(`${DERIV_REST_BASE}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${DERIV_API_TOKEN}`,
+      'Deriv-App-ID': String(DERIV_APP_ID),
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
   });
-  ws.on('message', (raw) => {
-    let msg; try { msg = JSON.parse(raw); } catch { return; }
-    if (msg.msg_type === 'authorize') {
-      if (msg.error) { tradingAuthError = msg.error.message; console.error('[trading] avtorizasiya xətası:', msg.error.message); tradingAuthorized = false; return; }
+  let json; try { json = await res.json(); } catch { json = null; }
+  if (!res.ok) {
+    const err = json?.errors?.[0];
+    throw new Error(err ? `${err.code}: ${err.message || ''}`.trim() : `HTTP ${res.status}`);
+  }
+  return json;
+}
+
+// Options trading hesabını tapır (demo hesabı üstün tutur); yoxdursa avtomatik yaradır
+async function ensureTradingAccount() {
+  const list = await derivRest('GET', '/trading/v1/options/accounts');
+  const accounts = list?.data || [];
+  let acc = accounts.find((a) => a.account_type === 'demo' || a.is_virtual === true);
+  if (!acc) {
+    const created = await derivRest('POST', '/trading/v1/options/accounts', { currency: 'USD', group: 'row', account_type: 'demo' });
+    acc = Array.isArray(created?.data) ? created.data[0] : created?.data;
+  }
+  if (!acc) throw new Error('Options trading hesabı tapılmadı/yaradılmadı');
+  tradingAccountId = acc.account_id || acc.id || acc.loginid;
+  tradingCurrency = acc.currency || 'USD';
+  tradingIsVirtual = acc.account_type ? acc.account_type === 'demo' : !!acc.is_virtual;
+}
+
+async function connectTradingWs() {
+  if (!DERIV_API_TOKEN) { console.log('[trading] DERIV_API_TOKEN boşdur — Telegram AL/Bağla düymələri deaktiv olacaq'); return; }
+  try {
+    if (!tradingAccountId) await ensureTradingAccount();
+    const otpRes = await derivRest('POST', `/trading/v1/options/accounts/${tradingAccountId}/otp`);
+    const otpUrl = otpRes?.data?.url;
+    if (!otpUrl) throw new Error('OTP url alınmadı');
+
+    const ws = new WebSocket(otpUrl);
+    tradingWs = ws;
+    ws.on('open', () => {
+      tradingReconnectDelay = 3000;
       tradingAuthError = null;
       tradingAuthorized = true;
-      tradingCurrency = msg.authorize.currency;
-      tradingIsVirtual = !!msg.authorize.is_virtual;
-      console.log(`[trading] avtorizasiya OK — ${msg.authorize.loginid} (${tradingIsVirtual ? 'DEMO' : 'REAL'}), valyuta: ${tradingCurrency}`);
-    }
-    if (msg.req_id && tradingPending.has(msg.req_id)) {
-      const p = tradingPending.get(msg.req_id);
-      tradingPending.delete(msg.req_id);
-      clearTimeout(p.timer);
-      if (msg.error) p.reject(new Error(msg.error.message));
-      else p.resolve(msg);
-    }
-  });
-  ws.on('close', (code, reasonBuf) => {
-    const reason = reasonBuf ? reasonBuf.toString() : '';
-    if (!tradingAuthorized) {
-      tradingAuthError = tradingAuthError || `Bağlantı ${opened ? 'açıldı amma bağlandı' : 'açılmadı'} (kod: ${code}${reason ? ', ' + reason : ''})`;
-    }
+      console.log(`[trading] qoşuldu — hesab: ${tradingAccountId} (${tradingIsVirtual ? 'DEMO' : 'REAL'}), valyuta: ${tradingCurrency}`);
+    });
+    ws.on('message', (raw) => {
+      let msg; try { msg = JSON.parse(raw); } catch { return; }
+      if (msg.req_id && tradingPending.has(msg.req_id)) {
+        const p = tradingPending.get(msg.req_id);
+        tradingPending.delete(msg.req_id);
+        clearTimeout(p.timer);
+        if (msg.error) p.reject(new Error(msg.error.message));
+        else p.resolve(msg);
+      }
+    });
+    ws.on('close', (code) => {
+      tradingAuthorized = false;
+      console.log(`[trading] bağlantı kəsildi (kod ${code}), ${Math.round(tradingReconnectDelay / 1000)}s sonra yenidən qoşulacaq`);
+      setTimeout(connectTradingWs, tradingReconnectDelay);
+      tradingReconnectDelay = Math.min(tradingReconnectDelay * 2, 30000);
+    });
+    ws.on('error', (e) => console.error('[trading] ws xətası:', e.message));
+  } catch (e) {
     tradingAuthorized = false;
-    console.log(`[trading] bağlantı kəsildi (kod ${code}), ${Math.round(tradingReconnectDelay / 1000)}s sonra yenidən qoşulacaq`);
+    tradingAuthError = e.message;
+    console.error('[trading] qoşulma xətası:', e.message);
     setTimeout(connectTradingWs, tradingReconnectDelay);
     tradingReconnectDelay = Math.min(tradingReconnectDelay * 2, 30000);
-  });
-  ws.on('error', (e) => { tradingAuthError = `WS xətası: ${e.message}`; console.error('[trading] ws xətası:', e.message); });
+  }
 }
 
 function tradingRequest(payload, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     if (!DERIV_API_TOKEN) return reject(new Error('DERIV_API_TOKEN qurulmayıb'));
-    if (tradingAuthError) return reject(new Error(`Deriv avtorizasiya xətası: ${tradingAuthError}`));
     if (!tradingWs || tradingWs.readyState !== WebSocket.OPEN || !tradingAuthorized) {
-      return reject(new Error('Trading bağlantısı hələ qurulur, bir neçə saniyə sonra yenidən cəhd edin'));
+      return reject(new Error(tradingAuthError ? `Deriv xətası: ${tradingAuthError}` : 'Trading bağlantısı hələ qurulur, bir neçə saniyə sonra yenidən cəhd edin'));
     }
     const req_id = tradingReqSeq++;
     const timer = setTimeout(() => { tradingPending.delete(req_id); reject(new Error('Deriv-dən cavab gəlmədi (timeout)')); }, timeoutMs);
@@ -501,21 +535,22 @@ function tradingRequest(payload, timeoutMs = 10000) {
   });
 }
 
+// Yeni API: birbaşa "buy" yoxdur, əvvəlcə "proposal" (qiymət təklifi), sonra onun id-si ilə "buy"
 async function buyContract(symbol, dir, durationMin) {
-  const msg = await tradingRequest({
-    buy: '1',
-    price: DERIV_STAKE_AMOUNT,
-    parameters: {
-      amount: DERIV_STAKE_AMOUNT,
-      basis: 'stake',
-      contract_type: dir,
-      currency: tradingCurrency || 'USD',
-      duration: durationMin,
-      duration_unit: 'm',
-      symbol,
-    },
+  const proposalMsg = await tradingRequest({
+    proposal: 1,
+    amount: DERIV_STAKE_AMOUNT,
+    basis: 'stake',
+    contract_type: dir,
+    currency: tradingCurrency || 'USD',
+    underlying_symbol: symbol,
+    duration: durationMin,
+    duration_unit: 'm',
   });
-  return msg.buy;
+  const p = proposalMsg.proposal;
+  if (!p?.id) throw new Error('Proposal alınmadı');
+  const buyMsg = await tradingRequest({ buy: p.id, price: p.ask_price });
+  return buyMsg.buy;
 }
 
 async function sellContract(contractId) {
@@ -783,12 +818,12 @@ async function reportTradingStatusOnBoot() {
     const acc = tradingIsVirtual ? 'DEMO' : 'REAL ⚠️';
     await telegram('sendMessage', {
       chat_id: TELEGRAM_CHAT_ID,
-      text: `✅ Trading bağlantısı hazırdır — hesab: ${acc}, valyuta: ${tradingCurrency}, stake: ${DERIV_STAKE_AMOUNT}. AL/Bağla düymələri aktivdir.`,
+      text: `✅ Trading bağlantısı hazırdır — hesab: ${acc} (${tradingAccountId}), valyuta: ${tradingCurrency}, stake: ${DERIV_STAKE_AMOUNT}. AL/Bağla düymələri aktivdir.`,
     });
   } else {
     await telegram('sendMessage', {
       chat_id: TELEGRAM_CHAT_ID,
-      text: `❌ Trading avtorizasiyası uğursuz oldu: ${tradingAuthError || '20 saniyədə heç bir cavab gəlmədi'} (token uzunluğu: ${DERIV_API_TOKEN.length} simvol). Token-i yoxlayın (Trade icazəsi işarələnməlidir).`,
+      text: `❌ Trading qoşulması uğursuz oldu: ${tradingAuthError || '20 saniyədə heç bir cavab gəlmədi'}\n\nDERIV_APP_ID: ${DERIV_APP_ID} (token uzunluğu: ${DERIV_API_TOKEN.length}).\nDiqqət: Deriv yeni sistemində DERIV_APP_ID developers.deriv.com Dashboard-da qeydiyyatdan keçirdiyiniz tətbiqin ID-si olmalıdır, köhnə ümumi 1089 işləməyə bilər.`,
     });
   }
 }
