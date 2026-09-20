@@ -436,6 +436,7 @@ function tfFromGranularity(g) {
 // === Trading bağlantısı (Telegram "AL/Bağla" düymələri üçün, market-data socketindən ayrı) ===
 let tradingWs = null;
 let tradingAuthorized = false;
+let tradingAuthError = null;
 let tradingCurrency = null;
 let tradingIsVirtual = null;
 let tradingReconnectDelay = 3000;
@@ -453,7 +454,8 @@ function connectTradingWs() {
   ws.on('message', (raw) => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
     if (msg.msg_type === 'authorize') {
-      if (msg.error) { console.error('[trading] avtorizasiya xətası:', msg.error.message); tradingAuthorized = false; return; }
+      if (msg.error) { tradingAuthError = msg.error.message; console.error('[trading] avtorizasiya xətası:', msg.error.message); tradingAuthorized = false; return; }
+      tradingAuthError = null;
       tradingAuthorized = true;
       tradingCurrency = msg.authorize.currency;
       tradingIsVirtual = !!msg.authorize.is_virtual;
@@ -478,8 +480,10 @@ function connectTradingWs() {
 
 function tradingRequest(payload, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
+    if (!DERIV_API_TOKEN) return reject(new Error('DERIV_API_TOKEN qurulmayıb'));
+    if (tradingAuthError) return reject(new Error(`Deriv avtorizasiya xətası: ${tradingAuthError}`));
     if (!tradingWs || tradingWs.readyState !== WebSocket.OPEN || !tradingAuthorized) {
-      return reject(new Error('Trading bağlantısı hazır deyil, bir az sonra yenidən cəhd edin'));
+      return reject(new Error('Trading bağlantısı hələ qurulur, bir neçə saniyə sonra yenidən cəhd edin'));
     }
     const req_id = tradingReqSeq++;
     const timer = setTimeout(() => { tradingPending.delete(req_id); reject(new Error('Deriv-dən cavab gəlmədi (timeout)')); }, timeoutMs);
@@ -638,9 +642,6 @@ async function handleCallbackQuery(cq) {
     if (data.startsWith('B|')) {
       const [, symbol, dir, durStr] = data.split('|');
       const durMin = Number(durStr) || 15;
-      if (!DERIV_API_TOKEN) throw new Error('DERIV_API_TOKEN qurulmayıb');
-      if (!tradingAuthorized) throw new Error('Trading bağlantısı hazır deyil, bir az gözləyin');
-      await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: '⏳ Sifariş göndərilir...' });
       const buy = await buyContract(symbol, dir, durMin);
       const acc = tradingIsVirtual ? 'DEMO' : 'REAL';
       const closeBtn = { inline_keyboard: [[{ text: '🔴 Bağla (indi sat)', callback_data: `S|${buy.contract_id}` }]] };
@@ -649,14 +650,15 @@ async function handleCallbackQuery(cq) {
         text: `${baseText}\n\n✅ <b>ALINDI (${acc})</b> — stake: ${DERIV_STAKE_AMOUNT} ${tradingCurrency || ''} · #${buy.contract_id}`,
         reply_markup: closeBtn,
       });
+      await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: '✅ Alındı' });
     } else if (data.startsWith('S|')) {
       const contractId = data.split('|')[1];
-      await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: '⏳ Bağlanır...' });
       const sell = await sellContract(contractId);
       await telegram('editMessageText', {
         chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
         text: `${baseText}\n\n🔒 <b>BAĞLANDI</b> — satış: ${sell.sold_for} ${tradingCurrency || ''}`,
       });
+      await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: '🔒 Bağlandı' });
     }
   } catch (e) {
     console.error('[telegram] callback xətası:', e.message);
@@ -757,8 +759,30 @@ async function verifyTelegramOnBoot() {
   });
 }
 
+async function reportTradingStatusOnBoot() {
+  if (!DERIV_API_TOKEN) {
+    await telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: 'ℹ️ DERIV_API_TOKEN qurulmayıb — AL/Bağla düymələri deaktiv olacaq.' });
+    return;
+  }
+  // authorize cavabı gəlməsi üçün bir neçə saniyə gözləyirik
+  await new Promise((r) => setTimeout(r, 5000));
+  if (tradingAuthorized) {
+    const acc = tradingIsVirtual ? 'DEMO' : 'REAL ⚠️';
+    await telegram('sendMessage', {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: `✅ Trading bağlantısı hazırdır — hesab: ${acc}, valyuta: ${tradingCurrency}, stake: ${DERIV_STAKE_AMOUNT}. AL/Bağla düymələri aktivdir.`,
+    });
+  } else {
+    await telegram('sendMessage', {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: `❌ Trading avtorizasiyası uğursuz oldu: ${tradingAuthError || 'səbəb bilinmir'}. Token-i yoxlayın (Trade icazəsi işarələnməlidir).`,
+    });
+  }
+}
+
 loadState();
 connectDeriv();
 connectTradingWs();
 pollTelegramUpdates();
 verifyTelegramOnBoot();
+reportTradingStatusOnBoot();
