@@ -1,5 +1,5 @@
-// SEYMUR13 DERIV — minimal service worker (PWA tələbi üçün)
-const CACHE_NAME = 'seymur13-deriv-shell-v1';
+// ORİONBOT DERIV — minimal service worker (PWA tələbi üçün)
+const CACHE_NAME = 'orionbot-deriv-shell-v1';
 const SHELL_FILES = ['./index.html', './manifest.json'];
 
 self.addEventListener('install', (event) => {
