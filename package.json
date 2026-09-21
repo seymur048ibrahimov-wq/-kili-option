@@ -1,7 +1,7 @@
 {
-  "name": "seymur13-deriv",
+  "name": "orionbot-deriv",
   "version": "1.0.0",
-  "description": "Seymur13 Deriv — Deriv sintetik indekslər üzrə çox-timeframe (1m/5m + 15m trend) binar opsion (CALL/PUT) siqnal botu, Telegram bildirişləri, PWA dashboard",
+  "description": "Orionbot Deriv — Deriv sintetik indekslər üzrə çox-timeframe (1m/5m + 15m trend) binar opsion (CALL/PUT) siqnal botu, Telegram bildirişləri, PWA dashboard",
   "type": "module",
   "main": "server.js",
   "scripts": {
