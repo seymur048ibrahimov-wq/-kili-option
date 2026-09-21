@@ -27,7 +27,7 @@ let urlIdx = 0;
 // miqyas dəyişib: LONG/SHORT yaranması üçün artıq minimum 3/4 ailə eyni istiqamətdə olmalıdır
 // (baza confidence >=75%), sonra ADX-ə görə davamlı şəkildə aşağı çəkilir. MIN_CONFIDENCE bunun
 // üzərinə əlavə süzgəcdir.
-const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 20);
+const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 50);
 const SIGNAL_COOLDOWN_MIN = Number(process.env.SIGNAL_COOLDOWN_MIN || 10);
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
@@ -53,8 +53,9 @@ const symbols = rawSyms ? rawSyms.split(',').map(s => s.trim()).filter(Boolean) 
 const TIMEFRAMES = ['15m'];
 const TREND_TF = '1h';
 const CONFIRM_TF = '5m';
-const GRANULARITY = { '5m': 300, '15m': 900, '1h': 3600 };
-const ALL_TFS = [CONFIRM_TF, ...TIMEFRAMES, TREND_TF];
+const MACRO_TFS = ['4h', '1d']; // yalnız kontekst (makro trend + aralıq) üçün — LONG/SHORT qərarına təsir etmir
+const GRANULARITY = { '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
+const ALL_TFS = [CONFIRM_TF, ...TIMEFRAMES, TREND_TF, ...MACRO_TFS];
 
 function key(symbol, tf) { return `${symbol}|${tf}`; }
 
@@ -73,6 +74,8 @@ const state = {
   // === Outcome-tracking (özünü-kalibrləmə) ===
   outcomeStats: new Map(), // confBucket -> { wins, losses }
   pendingOutcomes: [],     // göndərilmiş siqnalların hələ nəticəsi bilinməyənləri: { symbol, dir, tf, entryPrice, bucket, checkAt }
+  // === Risk / kill-switch ===
+  dayStartEquity: null, dayStartAt: 0, tradingHalted: false, haltReason: null,
 };
 
 function saveState() {
@@ -81,18 +84,54 @@ function saveState() {
     lastSignalAt: [...state.lastSignalAt.entries()],
     outcomeStats: [...state.outcomeStats.entries()],
     pendingOutcomes: state.pendingOutcomes,
+    dayStartEquity: state.dayStartEquity,
+    dayStartAt: state.dayStartAt,
+    tradingHalted: state.tradingHalted,
+    haltReason: state.haltReason,
   };
+  if (pgPool) {
+    pgPool.query(
+      `INSERT INTO deriv13_state(id,data,updated_at) VALUES(1,$1,now()) ON CONFLICT(id) DO UPDATE SET data=$1, updated_at=now()`,
+      [dump]
+    ).catch((e) => console.error('[state] Postgres yazma xətası:', e.message));
+    return;
+  }
   fs.writeFile(STATE_FILE, JSON.stringify(dump), (e) => { if (e) console.error('[state] yazma xətası:', e.message); });
 }
-function loadState() {
+async function loadState() {
+  let d = null;
+  if (pgPool) {
+    try { const res = await pgPool.query('SELECT data FROM deriv13_state WHERE id=1'); d = res.rows?.[0]?.data || null; }
+    catch (e) { console.error('[state] Postgres oxuma xətası:', e.message); }
+  }
+  if (!d) {
+    try { if (fs.existsSync(STATE_FILE)) d = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (e) {}
+  }
+  if (!d) return;
+  if (Array.isArray(d.signals)) state.signals = d.signals;
+  if (Array.isArray(d.lastSignalAt)) state.lastSignalAt = new Map(d.lastSignalAt);
+  if (Array.isArray(d.outcomeStats)) state.outcomeStats = new Map(d.outcomeStats);
+  if (Array.isArray(d.pendingOutcomes)) state.pendingOutcomes = d.pendingOutcomes;
+  if (d.dayStartEquity != null) state.dayStartEquity = d.dayStartEquity;
+  if (d.dayStartAt) state.dayStartAt = d.dayStartAt;
+  if (d.tradingHalted) { state.tradingHalted = true; state.haltReason = d.haltReason; }
+}
+// === İxtiyari Postgres (DATABASE_URL) — Railway-də disk müvəqqətidir (/tmp hər redeploy-da silinir),
+// ona görə kalibrasiya statistikası və kill-switch vəziyyəti Postgres olmadan hər dəyişiklikdən sonra itir.
+// DATABASE_URL təyin olunmayıbsa, avtomatik olaraq fayl-based saxlamaya (STATE_FILE) keçilir (işləyər,
+// amma redeploy-da sıfırlanar). Railway-də: New → Database → Postgres, sonra dəyişəni servisə bağla.
+let pgPool = null;
+async function initDb() {
+  if (!process.env.DATABASE_URL) { console.log('[state] DATABASE_URL yoxdur — fayl-based saxlama (/tmp) istifadə olunur, redeploy-da sıfırlanacaq'); return; }
   try {
-    if (!fs.existsSync(STATE_FILE)) return;
-    const d = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    if (Array.isArray(d.signals)) state.signals = d.signals;
-    if (Array.isArray(d.lastSignalAt)) state.lastSignalAt = new Map(d.lastSignalAt);
-    if (Array.isArray(d.outcomeStats)) state.outcomeStats = new Map(d.outcomeStats);
-    if (Array.isArray(d.pendingOutcomes)) state.pendingOutcomes = d.pendingOutcomes;
-  } catch (e) {}
+    const { Pool } = await import('pg');
+    pgPool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS deriv13_state (id INT PRIMARY KEY DEFAULT 1, data JSONB, updated_at TIMESTAMPTZ DEFAULT now())`);
+    console.log('[state] Postgres bağlantısı quruldu — vəziyyət daimi saxlanılacaq');
+  } catch (e) {
+    console.warn('[state] Postgres qoşula bilmədi ("pg" paketi quraşdırılıbmı?), fayl-based saxlamaya keçilir:', e.message);
+    pgPool = null;
+  }
 }
 
 // Bir bucket-ə WIN/LOSS nəticəsi əlavə edir
@@ -151,6 +190,11 @@ function cci(c,p=20){if(c.length<p)return null;const t=c.slice(-p).map(x=>(x.h+x
 function mfi(c,p=14){if(c.length<p+1)return null;let pos=0,neg=0;for(let i=c.length-p;i<c.length;i++){const a=(c[i-1].h+c[i-1].l+c[i-1].c)/3,b=(c[i].h+c[i].l+c[i].c)/3,m=b*c[i].v;if(b>a)pos+=m;else if(b<a)neg+=m;}if(neg===0)return 100;const r=pos/neg;return 100-100/(1+r);}
 function obvTrend(c,n=10){if(c.length<n+1)return 0;let s=0;for(let i=c.length-n;i<c.length;i++){if(c[i].c>c[i-1].c)s+=c[i].v;else if(c[i].c<c[i-1].c)s-=c[i].v;}return s;}
 function structure(c){if(c.length<20)return 0;const n=10,a=c.slice(-n),b=c.slice(-2*n,-n),ah=Math.max(...a.map(x=>x.h)),al=Math.min(...a.map(x=>x.l)),bh=Math.max(...b.map(x=>x.h)),bl=Math.min(...b.map(x=>x.l));return ah>bh&&al>bl?1:ah<bh&&al<bl?-1:0;}
+// === Əlavə (köməkçi) indikatorlar — yalnız OHLC əsasında, real "volume" tələb etmir ===
+function aroon(c,p=14){ if(c.length<p+1)return null; const s=c.slice(-(p+1)); let hiIdx=0,loIdx=0; for(let i=1;i<s.length;i++){ if(s[i].h>=s[hiIdx].h) hiIdx=i; if(s[i].l<=s[loIdx].l) loIdx=i; } return { up: 100*hiIdx/p, down: 100*loIdx/p }; }
+function roc(a,p=12){ if(a.length<p+1)return null; const prev=a[a.length-1-p]; return prev===0?null:((a.at(-1)-prev)/prev)*100; }
+function vortex(c,p=14){ if(c.length<p+1)return null; let vp=0,vm=0,tr=0; for(let i=c.length-p;i<c.length;i++){ vp+=Math.abs(c[i].h-c[i-1].l); vm+=Math.abs(c[i].l-c[i-1].h); tr+=Math.max(c[i].h-c[i].l,Math.abs(c[i].h-c[i-1].c),Math.abs(c[i].l-c[i-1].c)); } return tr===0?null:{ viPlus: vp/tr, viMinus: vm/tr }; }
+function donchian(c,p=20){ if(c.length<p)return null; const s=c.slice(-p); return { upper: Math.max(...s.map(x=>x.h)), lower: Math.min(...s.map(x=>x.l)) }; }
 function adx(c,p=14){
   if(c.length<p*2+1)return null;
   const plusDM=[],minusDM=[],tr=[];
@@ -250,7 +294,7 @@ function superTrend(c,p=10,mult=3){
 
 function analyze(c){
   if(c.length<60)return null;
-  const close=c.map(x=>x.c),price=close.at(-1),e9=ema(close,9),e21=ema(close,21),e50=ema(close,50),e200=ema(close,200),rv=rsi(close),mv=macd(close),bb=bollinger(close),st=stochastic(c),av=atr(c),cv=cci(c),str=structure(c),ax=adx(c),ich=ichimoku(c),psar=parabolicSar(c),piv=pivotPoints(c),fib=fibLevels(c),wr=williamsR(c),kelt=keltnerChannel(c,close),ha=heikinAshiTrend(c),stnd=superTrend(c);
+  const close=c.map(x=>x.c),price=close.at(-1),e9=ema(close,9),e21=ema(close,21),e50=ema(close,50),e200=ema(close,200),rv=rsi(close),mv=macd(close),bb=bollinger(close),st=stochastic(c),av=atr(c),cv=cci(c),str=structure(c),ax=adx(c),ich=ichimoku(c),psar=parabolicSar(c),piv=pivotPoints(c),fib=fibLevels(c),wr=williamsR(c),kelt=keltnerChannel(c,close),ha=heikinAshiTrend(c),stnd=superTrend(c),aro=aroon(c),rc=roc(close),vtx=vortex(c),donch=donchian(c);
   // QEYD: OBV/MFI/VWAP HESABLANMIR — Deriv sintetik indekslərində real "volume" yoxdur
   // (aşağıda hər şam üçün v:1 sabit qoyulur), ona görə bu indikatorlar burda mənasız/aldadıcı
   // olardı və score-a əlavə "sanki-güvən" verərdi. OKX kripto versiyasında (real hədcm datası ilə)
@@ -274,6 +318,8 @@ function analyze(c){
   if(psar){if(psar.uptrend){trendVotes++;reasons.push('Parabolic SAR yüksəliş');}else{trendVotes--;reasons.push('Parabolic SAR düşüş');}}
   if(ha!==0){if(ha>0){trendVotes++;reasons.push('Heikin-Ashi yüksəliş');}else{trendVotes--;reasons.push('Heikin-Ashi düşüş');}}
   if(stnd){if(stnd.uptrend){trendVotes++;reasons.push('SuperTrend yüksəliş');}else{trendVotes--;reasons.push('SuperTrend düşüş');}}
+  if(aro){if(aro.up>70&&aro.down<30){trendVotes++;reasons.push('Aroon yüksəliş');}else if(aro.down>70&&aro.up<30){trendVotes--;reasons.push('Aroon düşüş');}}
+  if(vtx){if(vtx.viPlus>vtx.viMinus){trendVotes++;reasons.push('Vortex +');}else if(vtx.viMinus>vtx.viPlus){trendVotes--;reasons.push('Vortex -');}}
   const trendCat=trendVotes>0?1:trendVotes<0?-1:0;
 
   let momVotes=0;
@@ -281,11 +327,13 @@ function analyze(c){
   if(st<20){momVotes++;reasons.push('Stoch oversold');}else if(st>80){momVotes--;reasons.push('Stoch overbought');}
   if(cv<-100){momVotes++;reasons.push('CCI oversold');}else if(cv>100){momVotes--;reasons.push('CCI overbought');}
   if(wr!=null){if(wr<-80){momVotes++;reasons.push('Williams %R oversold');}else if(wr>-20){momVotes--;reasons.push('Williams %R overbought');}}
+  if(rc!=null){if(rc>0){momVotes++;reasons.push('ROC +');}else if(rc<0){momVotes--;reasons.push('ROC -');}}
   const momCat=momVotes>0?1:momVotes<0?-1:0;
 
   let volVotes=0;
   if(bb){if(price<=bb.lower){volVotes++;reasons.push('BB alt zolaq');}else if(price>=bb.upper){volVotes--;reasons.push('BB üst zolaq');}}
   if(kelt){if(price<=kelt.lower){volVotes++;reasons.push('Keltner alt zolaq');}else if(price>=kelt.upper){volVotes--;reasons.push('Keltner üst zolaq');}}
+  if(donch){if(price<=donch.lower){volVotes++;reasons.push('Donchian alt sərhəd');}else if(price>=donch.upper){volVotes--;reasons.push('Donchian üst sərhəd');}}
   const volCat=volVotes>0?1:volVotes<0?-1:0;
 
   let srVotes=0;
@@ -343,7 +391,16 @@ function fullAnalysis(symbol){
 
   const dir = final === 'LONG' ? 'CALL' : final === 'SHORT' ? 'PUT' : 'WAIT';
   const reasons = [...new Set([...(m5?.reasons||[]), ...(m15?.reasons||[]), ...(h1?.reasons||[])])].slice(0, 6);
-  return { symbol, dir, confidence, expiry, strength, confluence, price: m15.price, atr: m15.atr, rsi: m15.rsi, timeframes: a, reasons };
+
+  // === Makro (1D) trend + 4H/24H qiymət aralığı — yalnız kontekst, LONG/SHORT qərarına təsir etmir ===
+  const d1 = a['1d'];
+  const macroTrend = d1 ? (d1.score > 0 ? 'up' : d1.score < 0 ? 'down' : 'flat') : null;
+  const last4h = getCandles(symbol, '4h').at(-1);
+  const range4h = last4h ? { lo: last4h.l, hi: last4h.h } : null;
+  const last24h1 = getCandles(symbol, '1h').slice(-24);
+  const range24h = last24h1.length ? { lo: Math.min(...last24h1.map(x => x.l)), hi: Math.max(...last24h1.map(x => x.h)) } : null;
+
+  return { symbol, dir, confidence, expiry, strength, confluence, price: m15.price, atr: m15.atr, rsi: m15.rsi, timeframes: a, reasons, macroTrend, range4h, range24h };
 }
 
 function getCandles(symbol, tf) { return state.candles.get(key(symbol, tf)) || []; }
@@ -659,6 +716,43 @@ async function sellContract(contractId) {
   return msg.sell;
 }
 
+// === Gündəlik itki limiti (kill-switch) ===
+// Krip-to botundakı eyni prinsip: gündə balansın müəyyən faizindən çox itirilsə, AL düymələri
+// avtomatik bloklanır — sabahkı balans sıfırlanmasına qədər. Default 0 = deaktiv (istəyə bağlı,
+// çünki bəzi istifadəçilər üçün DEMO hesabda mənası olmaya bilər); real hesabda MAX_DAILY_LOSS_PCT
+// env dəyişənini (məs. 5) təyin etməklə aktivləşdirilir.
+const MAX_DAILY_LOSS_PCT = Number(process.env.MAX_DAILY_LOSS_PCT || 0);
+async function getBalance() {
+  const msg = await tradingRequest({ balance: 1 });
+  return msg?.balance || null;
+}
+async function checkDailyLossLimit() {
+  if (MAX_DAILY_LOSS_PCT <= 0) return;
+  if (!tradingAuthorized) return;
+  try {
+    const bal = await getBalance();
+    const eq = Number(bal?.balance);
+    if (!eq || isNaN(eq)) return;
+    const now = Date.now(), dayMs = 24 * 60 * 60 * 1000;
+    if (!state.dayStartEquity || now - state.dayStartAt > dayMs) {
+      state.dayStartEquity = eq; state.dayStartAt = now; state.tradingHalted = false; state.haltReason = null;
+      saveState();
+      return;
+    }
+    const dropPct = ((state.dayStartEquity - eq) / state.dayStartEquity) * 100;
+    if (dropPct >= MAX_DAILY_LOSS_PCT && !state.tradingHalted) {
+      state.tradingHalted = true;
+      state.haltReason = `Gündəlik zərər limiti aşıldı: -${dropPct.toFixed(2)}% (limit ${MAX_DAILY_LOSS_PCT}%)`;
+      saveState();
+      await telegram('sendMessage', {
+        chat_id: TELEGRAM_CHAT_ID, parse_mode: 'HTML',
+        text: `🛑 <b>KILL-SWITCH AKTİVLƏŞDİ</b>\n${state.haltReason}\nAL düymələri müvəqqəti bloklandı. Balans növbəti gün sıfırlananda avtomatik bərpa olunacaq.`,
+      });
+    }
+  } catch (e) { console.error('[risk] gündəlik itki yoxlaması xətası:', e.message); }
+}
+setInterval(checkDailyLossLimit, 5 * 60 * 1000);
+
 function expiryMinutes(expiry) {
   const m = /^(\d+)/.exec(expiry || '');
   return m ? Number(m[1]) : 15;
@@ -723,7 +817,7 @@ function runAnalysis(symbol) {
     return;
   }
 
-  const entry = { ts: now, symbol, dir: r.dir, confidence: r.confidence, expiry: r.expiry, strength: r.strength, confluence: r.confluence, price: r.price, reasons: r.reasons, calibratedWinProb: calWin };
+  const entry = { ts: now, symbol, dir: r.dir, confidence: r.confidence, expiry: r.expiry, strength: r.strength, confluence: r.confluence, price: r.price, reasons: r.reasons, calibratedWinProb: calWin, macroTrend: r.macroTrend, range4h: r.range4h, range24h: r.range24h };
   state.signals.unshift(entry);
   state.signals = state.signals.slice(0, 200);
   saveState();
@@ -760,26 +854,31 @@ async function telegram(method, body, attempt = 1) {
 }
 function confBar(pct) { const filled = Math.round((pct || 0) / 10); return '█'.repeat(filled) + '░'.repeat(10 - filled); }
 function fmt(x) { return x == null ? '--' : Number(x).toLocaleString('en-US', { maximumFractionDigits: 5 }); }
+function macroEmoji(t) { return t === 'up' ? '🟢 yuxarı' : t === 'down' ? '🔴 aşağı' : t ? '⚪ neytral' : '—'; }
+function rangeText(r) { return r ? `${fmt(r.lo)} – ${fmt(r.hi)}` : '—'; }
 async function sendTelegramSignal(r) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) { console.error('[telegram] TOKEN/CHAT_ID boşdur, siqnal göndərilmədi'); return; }
   const emoji = r.dir === 'CALL' ? '📈' : '📉';
-  const dirText = r.dir === 'CALL' ? 'CALL (yuxarı)' : 'PUT (aşağı)';
+  const dirText = r.dir === 'CALL' ? '🟢 LONG (AL)' : '🔴 SHORT (SAT)';
   const expText = r.expiry === '15m' ? '15 dəqiqə' : '5 dəqiqə';
-  const confluenceText = r.confluence != null ? ` — 🟢${r.confluence}/3` : '';
+  const calWin = calibratedWinProb(r.confidence);
+  const calText = calWin != null
+    ? `${calWin.toFixed(0)}% (breakeven: ${BREAKEVEN_PROB.toFixed(0)}%)`
+    : `hələ kifayət qədər tarixi nəticə yoxdur (min. ${MIN_SAMPLES_FOR_CALIBRATION})`;
   const autoTradeNote = DERIV_API_TOKEN
     ? '<i>Aşağıdakı düymə ilə bir kliklə Deriv-də əməliyyat açıla bilər.</i>'
     : '<i>Bu avtomatik texniki siqnaldır, maliyyə məsləhəti deyil. Auto-trade hələ aktiv deyil.</i>';
-  const calWin = calibratedWinProb(r.confidence);
-  const calText = calWin != null
-    ? `Faktiki (kalibrlənmiş) nəticə: <b>${calWin.toFixed(0)}%</b> (breakeven: ${BREAKEVEN_PROB.toFixed(0)}%)`
-    : `Bu bucket üçün hələ kifayət qədər tarixi nəticə yoxdur (min. ${MIN_SAMPLES_FOR_CALIBRATION})`;
   const lines = [
-    `${emoji} <b>${r.symbol}</b> — <b>${dirText}</b>${confluenceText}`,
-    `Tövsiyə olunan expiry: <b>${expText}</b> (${r.strength})`,
-    `Etibar (model): <b>${r.confidence}%</b> ${confBar(r.confidence)}`,
-    calText,
-    `Qiymət: <code>${fmt(r.price)}</code>`,
-    `Səbəblər: ${r.reasons.join(', ')}`,
+    `💎 <b>${r.symbol}</b>`,
+    `${dirText}   Etibar: <b>${r.confidence}%</b> ${confBar(r.confidence)}`,
+    `📍 Giriş: <code>${fmt(r.price)}</code>`,
+    `⏱ Expiry: <b>${expText}</b> (${r.strength}${r.confluence != null ? `, 🟢${r.confluence}/3` : ''})`,
+    `${emoji} Kalibrlənmiş nəticə: <b>${calText}</b>`,
+    `📅 Makro (1D): ${macroEmoji(r.macroTrend)}`,
+    `📊 4H aralıq: ${rangeText(r.range4h)}`,
+    `📊 24H aralıq: ${rangeText(r.range24h)}`,
+    `🧩 Səbəblər: ${r.reasons.join(', ')}`,
+    `<i>ℹ️ Bu Rise/Fall (sabit ödənişli) opsiondur — açıq mövqe olmadığı üçün Stop Loss/Take Profit/Leverage tətbiq olunmur; müqavilə ${expText} sonra avtomatik bağlanır.</i>`,
     autoTradeNote,
   ];
   const btnText = r.dir === 'CALL' ? '🟢 AL (CALL)' : '🔴 SAT (PUT)';
@@ -802,6 +901,10 @@ async function handleCallbackQuery(cq) {
   const baseText = cq.message.text || '';
   try {
     if (data.startsWith('B|')) {
+      if (state.tradingHalted) {
+        await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: `🛑 Bloklanıb: ${state.haltReason || 'kill-switch aktiv'}`, show_alert: true });
+        return;
+      }
       const [, symbol, dir, durStr] = data.split('|');
       const durMin = Number(durStr) || 15;
       const buy = await buyContract(symbol, dir, durMin);
@@ -829,20 +932,25 @@ async function handleCallbackQuery(cq) {
 }
 
 let tgUpdateOffset = 0;
+let tgPollDelay = 500; // uğursuz cəhdlərdə tədricən artır (max 30s) — Conflict zamanı iki instansiyanın bir-birini daim "boğmasının" qarşısını alır
 async function pollTelegramUpdates() {
   if (!TELEGRAM_TOKEN) return;
   try {
     const res = await telegram('getUpdates', { offset: tgUpdateOffset, timeout: 25, allowed_updates: ['callback_query'] });
     if (res && res.ok && Array.isArray(res.result)) {
+      tgPollDelay = 500; // uğurlu cavab — gecikməni sıfırla
       for (const upd of res.result) {
         tgUpdateOffset = upd.update_id + 1;
         if (upd.callback_query) await handleCallbackQuery(upd.callback_query);
       }
+    } else if (res && res.ok === false) {
+      tgPollDelay = Math.min(tgPollDelay * 2, 30000); // Conflict və s. — geriyə-çəkilmə
     }
   } catch (e) {
     console.error('[telegram] polling xətası:', e.message);
+    tgPollDelay = Math.min(tgPollDelay * 2, 30000);
   } finally {
-    setTimeout(pollTelegramUpdates, 500);
+    setTimeout(pollTelegramUpdates, tgPollDelay);
   }
 }
 
@@ -887,6 +995,9 @@ app.get('/api/state', (req, res) => {
     signals: state.signals.slice(0, 50),
     analysis: Object.fromEntries(state.lastAnalysis),
     startedAt: state.startedAt,
+    tradingHalted: state.tradingHalted,
+    haltReason: state.haltReason,
+    persistence: pgPool ? 'postgres' : 'file (müvəqqəti — DATABASE_URL yoxdur)',
   });
 });
 app.get('/api/analyze/:sym', (req, res) => {
@@ -937,6 +1048,13 @@ async function verifyTelegramOnBoot() {
     return;
   }
   console.log(`[telegram] Bot təsdiqləndi: @${me.result.username}`);
+  // Unudulmuş/köhnə webhook aktivdirsə, getUpdates (uzun-polling) onunla İŞLƏMİR və Conflict xətası verir —
+  // ona görə hər startup-da avtomatik yoxlanılıb təmizlənir (bu, polling başlamazdan ƏVVƏL edilməlidir).
+  const wh = await telegram('getWebhookInfo', {});
+  if (wh?.ok && wh.result?.url) {
+    console.warn(`[telegram] Aktiv webhook tapıldı (${wh.result.url}) — getUpdates ilə uyğun gəlmir, silinir...`);
+    await telegram('deleteWebhook', {});
+  }
   await telegram('sendMessage', {
     chat_id: TELEGRAM_CHAT_ID,
     text: '✅ Deriv siqnal botu işə düşdü və bağlıdır.',
@@ -968,9 +1086,13 @@ async function reportTradingStatusOnBoot() {
   }
 }
 
-loadState();
-connectDeriv();
-connectTradingWs();
-pollTelegramUpdates();
-verifyTelegramOnBoot();
-reportTradingStatusOnBoot();
+async function main() {
+  await initDb();
+  await loadState();
+  connectDeriv();
+  connectTradingWs();
+  await verifyTelegramOnBoot(); // webhook təmizlənməsi polling BAŞLAMAZDAN ƏVVƏL bitməlidir (Conflict-in qarşısını alır)
+  pollTelegramUpdates();
+  reportTradingStatusOnBoot();
+}
+main();
