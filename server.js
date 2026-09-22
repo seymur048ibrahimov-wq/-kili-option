@@ -454,21 +454,29 @@ function connectDeriv() {
   });
 
   function subscribeCandles(symbolList) {
-    for (const symbol of symbolList) {
-      for (const tf of ALL_TFS) {
-        const id = reqSeq++;
-        reqMeta.set(id, { symbol, tf });
-        ws.send(JSON.stringify({
-          ticks_history: symbol,
-          style: 'candles',
-          granularity: GRANULARITY[tf],
-          count: 300,
-          end: 'latest',
-          subscribe: 1,
-          req_id: id,
-        }));
-      }
-    }
+    // Deriv qoşulan kimi bütün abunəlikləri (indi 5 simvol × 5 taymfreym = 25) bir anda göndərmək
+    // sürət limitinə toxunub bağlantının qəfil kəsilməsinə səbəb ola bilir — ona görə sorğular
+    // arasına kiçik fasilə qoyulur (partlayış əvəzinə tədricən göndərilir).
+    const jobs = [];
+    for (const symbol of symbolList) for (const tf of ALL_TFS) jobs.push({ symbol, tf });
+    let i = 0;
+    const sendNext = () => {
+      if (ws.readyState !== WebSocket.OPEN || i >= jobs.length) return;
+      const { symbol, tf } = jobs[i++];
+      const id = reqSeq++;
+      reqMeta.set(id, { symbol, tf });
+      ws.send(JSON.stringify({
+        ticks_history: symbol,
+        style: 'candles',
+        granularity: GRANULARITY[tf],
+        count: 300,
+        end: 'latest',
+        subscribe: 1,
+        req_id: id,
+      }));
+      setTimeout(sendNext, 150);
+    };
+    sendNext();
   }
 
   // Cavabdan (symbol, tf) tapır: req_id → subscription.id → echo_req → sahələr
