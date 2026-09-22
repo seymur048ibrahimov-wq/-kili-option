@@ -72,8 +72,9 @@ const state = {
   activeSymbols: symbols.slice(),
   availableSymbols: [],
   // === Outcome-tracking (özünü-kalibrləmə) ===
-  outcomeStats: new Map(), // confBucket -> { wins, losses }
-  pendingOutcomes: [],     // göndərilmiş siqnalların hələ nəticəsi bilinməyənləri: { symbol, dir, tf, entryPrice, bucket, checkAt }
+  outcomeStats: new Map(), // "symbol|confBucket" -> { wins, losses }
+  pendingOutcomes: [],     // göndərilmiş siqnalların hələ nəticəsi bilinməyənləri: { symbol, dir, tf, entryPrice, bucket, checkAt, reasons }
+  indicatorStats: new Map(), // reason (indikator etiketi, məs. "RSI oversold") -> { wins, losses } — hansı indikatorun həqiqətən işlədiyini izləmək üçün
   // === Risk / kill-switch ===
   dayStartEquity: null, dayStartAt: 0, tradingHalted: false, haltReason: null,
 };
@@ -84,6 +85,7 @@ function saveState() {
     lastSignalAt: [...state.lastSignalAt.entries()],
     outcomeStats: [...state.outcomeStats.entries()],
     pendingOutcomes: state.pendingOutcomes,
+    indicatorStats: [...state.indicatorStats.entries()],
     dayStartEquity: state.dayStartEquity,
     dayStartAt: state.dayStartAt,
     tradingHalted: state.tradingHalted,
@@ -112,6 +114,7 @@ async function loadState() {
   if (Array.isArray(d.lastSignalAt)) state.lastSignalAt = new Map(d.lastSignalAt);
   if (Array.isArray(d.outcomeStats)) state.outcomeStats = new Map(d.outcomeStats);
   if (Array.isArray(d.pendingOutcomes)) state.pendingOutcomes = d.pendingOutcomes;
+  if (Array.isArray(d.indicatorStats)) state.indicatorStats = new Map(d.indicatorStats);
   if (d.dayStartEquity != null) state.dayStartEquity = d.dayStartEquity;
   if (d.dayStartAt) state.dayStartAt = d.dayStartAt;
   if (d.tradingHalted) { state.tradingHalted = true; state.haltReason = d.haltReason; }
@@ -134,19 +137,34 @@ async function initDb() {
   }
 }
 
-// Bir bucket-ə WIN/LOSS nəticəsi əlavə edir
-function recordOutcome(bucket, win) {
-  const s = state.outcomeStats.get(bucket) || { wins: 0, losses: 0 };
+// Bir bucket-ə (simvol + confidence aralığı) WIN/LOSS nəticəsi əlavə edir — hər simvol AYRI izlənilir,
+// çünki R_10 ilə R_100 çox fərqli davranır, ortaq statistika yanlış rəhbərlik edə bilər.
+function outcomeKey(symbol, bucket) { return `${symbol}|${bucket}`; }
+function recordOutcome(symbol, bucket, win) {
+  const k = outcomeKey(symbol, bucket);
+  const s = state.outcomeStats.get(k) || { wins: 0, losses: 0 };
   if (win) s.wins++; else s.losses++;
-  state.outcomeStats.set(bucket, s);
+  state.outcomeStats.set(k, s);
 }
-// Bu confidence bucket-i üçün kifayət qədər tarixi nəticə varsa, faktiki win-rate qaytarır (yoxdursa null)
-function calibratedWinProb(confidence) {
-  const s = state.outcomeStats.get(confBucket(confidence));
+// Wilson score aşağı sərhədi: kiçik nümunə sayında sadə "wins/total" nisbəti aldadıcı ola bilər —
+// məs. 20 nəticədə 60% görünsə də, real ehtimal statistik olaraq 40-80% arasında ola bilər. Wilson
+// bunun KONSERVATİV (aşağı sərhəd) qiymətini verir — "şansla" gələn qısa uğurlu seriyanı əsl edge
+// kimi qəbul etməməyə kömək edir. z=1.645 ≈ 95% birtərəfli etibar səviyyəsi (ehtiyatlı seçim).
+function wilsonLowerBound(wins, total, z = 1.645) {
+  if (total === 0) return null;
+  const phat = wins / total;
+  const denom = 1 + (z * z) / total;
+  const center = phat + (z * z) / (2 * total);
+  const margin = z * Math.sqrt((phat * (1 - phat) + (z * z) / (4 * total)) / total);
+  return (center - margin) / denom;
+}
+// Bu simvol + confidence bucket-i üçün kifayət qədər tarixi nəticə varsa, KONSERVATİV win-rate qaytarır
+function calibratedWinProb(symbol, confidence) {
+  const s = state.outcomeStats.get(outcomeKey(symbol, confBucket(confidence)));
   if (!s) return null;
   const total = s.wins + s.losses;
   if (total < MIN_SAMPLES_FOR_CALIBRATION) return null;
-  return (s.wins / total) * 100;
+  return wilsonLowerBound(s.wins, total) * 100;
 }
 // Siqnal göndəriləndə "virtual" nəticə izləməyə qoşulur: expiry bitəndə qiymət hansı tərəfə
 // getdiyinə görə WIN/LOSS qeydə alınır — real pul qoymasa belə statistika toplanır
@@ -156,8 +174,16 @@ function scheduleOutcomeCheck(entry) {
     symbol: entry.symbol, dir: entry.dir, tf: entry.expiry,
     entryPrice: entry.price, bucket: confBucket(entry.confidence),
     checkAt: Date.now() + minutes * 60 * 1000,
+    reasons: entry.reasons, // hansı indikatorlar bu siqnalı yaratdı — nəticə bəlliyəndə performans izləmək üçün
   });
   saveState();
+}
+function recordIndicatorOutcome(reasons, win) {
+  for (const reason of reasons || []) {
+    const s = state.indicatorStats.get(reason) || { wins: 0, losses: 0 };
+    if (win) s.wins++; else s.losses++;
+    state.indicatorStats.set(reason, s);
+  }
 }
 function checkPendingOutcomes() {
   const now = Date.now();
@@ -172,7 +198,8 @@ function checkPendingOutcomes() {
       continue; // 5 dəqiqədən çoxdursa, data heç gəlməyib — bu nümunəni atırıq
     }
     const win = p.dir === 'CALL' ? last.c > p.entryPrice : last.c < p.entryPrice;
-    recordOutcome(p.bucket, win);
+    recordOutcome(p.symbol, p.bucket, win);
+    recordIndicatorOutcome(p.reasons, win);
   }
   state.pendingOutcomes = still;
   saveState();
@@ -352,7 +379,7 @@ function analyze(c){
     confidence=Math.round(confidence*(0.55+0.45*adxFactor));
     reasons.push(`ADX ${ax.toFixed(0)}`);
   }
-  let signal=score>=3?'LONG':score<=-3?'SHORT':'WAIT';
+  let signal=score>0?'LONG':score<0?'SHORT':'WAIT'; // artıq zəif meyl də (score=±1/±2) göstərilir, yalnız tam neytral (0) WAIT-dır
   // Çox zəif/trendsiz bazar (ADX<10): bu şəraitdə demək olar bütün trend indikatorları aldadıcıdır,
   // ona görə MIN_CONFIDENCE-dan asılı olmayaraq tam bloklanır
   if (ax!=null && ax<10) { signal='WAIT'; reasons.push('ADX<10 — trendsiz bazar, bloklandı'); }
@@ -370,20 +397,23 @@ function fullAnalysis(symbol){
   const m5 = a[CONFIRM_TF], m15 = a['15m'], h1 = a[TREND_TF];
   if (!m15) return null;
 
-  let final = 'WAIT', expiry = null, strength = 'zəif';
+  let final = m15.signal, expiry = final !== 'WAIT' ? '15m' : null;
+  // Gücə görə 3 pilləli etiket — artıq h1 ilə TAM üst-üstə düşmə tələb OLUNMUR (əvvəlki versiyada
+  // final yalnız m15===h1 olanda təyin olunurdu, bu da praktikada saatlarla heç bir mesaj gəlməməsinə
+  // səbəb olurdu). İndi hər meyl göstərilir, gücü isə aydın etiketlənir ki, istifadəçi özü seçə bilsin.
   let confluence = 0;
   if (m15.signal !== 'WAIT') confluence++;
-  if (h1 && h1.signal === m15.signal) confluence++;
-  if (m5 && m5.signal === m15.signal) confluence++;
-
-  if (h1 && m15.signal !== 'WAIT' && m15.signal === h1.signal) {
-    final = m15.signal; expiry = '15m';
-    strength = (m5 && m5.signal === final) ? 'çox güclü (5m+15m+1h uyğun)' : 'güclü (15m+1h trend uyğun)';
-  }
+  if (h1 && final !== 'WAIT' && h1.signal === final) confluence++;
+  if (m5 && final !== 'WAIT' && m5.signal === final) confluence++;
+  const absScore = Math.abs(m15.score);
+  let strength;
+  if (absScore >= 3 && confluence >= 2) strength = '🟢 güclü';
+  else if (absScore >= 2 || confluence >= 1) strength = '🟡 orta';
+  else strength = '🔴 zəif';
 
   let confidence = m15.confidence;
   if (final !== 'WAIT') {
-    const parts = [m15.confidence, h1?.confidence, (m5 && m5.signal === final) ? m5.confidence : null].filter(x => x != null);
+    const parts = [m15.confidence, (h1 && h1.signal === final) ? h1.confidence : null, (m5 && m5.signal === final) ? m5.confidence : null].filter(x => x != null);
     confidence = Math.round(parts.reduce((s, x) => s + x, 0) / parts.length);
     if (h1 && h1.signal === final) confidence = Math.min(100, confidence + 6);
     if (m5 && m5.signal === final) confidence = Math.min(100, confidence + 4);
@@ -719,6 +749,31 @@ async function buyContract(symbol, dir, durationMin) {
   return buyMsg.buy;
 }
 
+// === Real vaxtda ödəniş faizi ===
+// Sabit PAYOUT_PCT (90%) təxminidir — Deriv-in faktiki ödənişi simvol/vaxta görə fərqlənə bilər.
+// Trading bağlantısı aktivdirsə, hər göndəriləcək siqnal üçün əsl "proposal" sorğusu ilə DƏQİQ
+// ödəniş faizini çəkirik və breakeven-i ONUN üzərindən hesablayırıq — statik təxmindən daha dəqiqdir.
+async function getLivePayoutPct(symbol, dir, durationMin) {
+  if (!tradingAuthorized) return null;
+  try {
+    const proposalMsg = await tradingRequest({
+      proposal: 1,
+      amount: DERIV_STAKE_AMOUNT,
+      basis: 'stake',
+      contract_type: dir,
+      currency: tradingCurrency || 'USD',
+      underlying_symbol: symbol,
+      duration: durationMin,
+      duration_unit: 'm',
+    }, 6000);
+    const p = proposalMsg.proposal;
+    if (!p?.payout || !p?.ask_price) return null;
+    return ((p.payout - p.ask_price) / p.ask_price) * 100;
+  } catch (e) {
+    return null; // sükutla statik PAYOUT_PCT-ə geri qayıdır
+  }
+}
+
 async function sellContract(contractId) {
   const msg = await tradingRequest({ sell: contractId, price: 0 });
   return msg.sell;
@@ -784,7 +839,7 @@ function onCandleUpdate(symbol) {
   }, 500));
 }
 
-function runAnalysis(symbol) {
+async function runAnalysis(symbol) {
   let r;
   try { r = fullAnalysis(symbol); }
   catch (e) { console.error(`[analiz] ${symbol} xətası:`, e.message); return; }
@@ -813,18 +868,24 @@ function runAnalysis(symbol) {
   const cooldownPassed = prev && now - prev.ts >= cooldownMs;
   if (!dirChanged && !bigConfidenceShift && !cooldownPassed) return;
 
-  // === Kalibrasiya/EV süzgəci ===
-  // Bu confidence bucket-i üçün kifayət qədər tarixi (virtual və ya real) nəticə toplanıbsa və
-  // faktiki win-rate breakeven-dən aşağıdırsa, bu bucket statistik olaraq zərərli deməkdir —
-  // MIN_CONFIDENCE-i keçsə belə siqnal göndərilmir. Cooldown/lastSignalAt yenə də güncəllənir ki,
-  // hər analiz dövründə eyni bloklanmış siqnal spam kimi təkrar-təkrar qiymətləndirilməsin.
-  state.lastSignalAt.set(symbol, { dir: r.dir, ts: now, confidence: r.confidence });
-  const calWin = calibratedWinProb(r.confidence);
-  if (calWin != null && calWin < BREAKEVEN_PROB) {
-    console.log(`[siqnal] ${symbol} ${r.dir} bloklandı — bucket win-rate ${calWin.toFixed(1)}% < breakeven ${BREAKEVEN_PROB.toFixed(1)}%`);
-    return;
-  }
+  // === Real vaxtda ödəniş faizi (mümkünsə) ===
+  // Trading bağlantısı aktivdirsə, sabit PAYOUT_PCT (90%) təxmini əvəzinə Deriv-dən DƏQİQ ödəniş
+  // faizini çəkirik — breakeven həddi bunun üzərindən hesablanır. Bağlantı yoxdursa/uğursuz olsa,
+  // sükutla statik PAYOUT_PCT/BREAKEVEN_PROB-a geri qayıdır.
+  const livePayoutPct = await getLivePayoutPct(symbol, r.dir, expiryMinutes(r.expiry));
+  r.livePayoutPct = livePayoutPct;
+  r.breakevenProb = livePayoutPct != null ? 100 / (1 + livePayoutPct / 100) : BREAKEVEN_PROB;
 
+  // === Kalibrasiya/EV məlumatı ===
+  // ƏVVƏLKİ VERSİYADA bu, breakeven-dən aşağı bucket-lərdə siqnalı TAM BLOKLAYIRDI. İndi istifadəçi
+  // zəif/riskli siqnalları da görüb ÖZÜ seçmək istədiyi üçün — mesaj hər halda göndərilir, sadəcə
+  // kalibrasiya nəticəsi aşağıdırsa aydın ⚠️ RİSKLİ xəbərdarlığı ilə işarələnir.
+  state.lastSignalAt.set(symbol, { dir: r.dir, ts: now, confidence: r.confidence });
+  const calWin = calibratedWinProb(r.symbol, r.confidence);
+  r.riskyBucket = calWin != null && calWin < r.breakevenProb;
+
+  // === İndikator-səviyyəli performans üçün: bu siqnalın hansı konkret səbəblərdən (indikatorlardan)
+  // yarandığını da saxlayırıq ki, nəticə bəlli olanda hansı indikatorların həqiqətən işlədiyini görək ===
   const entry = { ts: now, symbol, dir: r.dir, confidence: r.confidence, expiry: r.expiry, strength: r.strength, confluence: r.confluence, price: r.price, reasons: r.reasons, calibratedWinProb: calWin, macroTrend: r.macroTrend, range4h: r.range4h, range24h: r.range24h };
   state.signals.unshift(entry);
   state.signals = state.signals.slice(0, 200);
@@ -861,6 +922,20 @@ async function telegram(method, body, attempt = 1) {
   }
 }
 function confBar(pct) { const filled = Math.round((pct || 0) / 10); return '█'.repeat(filled) + '░'.repeat(10 - filled); }
+// === Yekun "qərar" sətri ===
+// Bütün rəqəmləri (güc, kalibrasiya, risk) TƏK bir aydın tövsiyəyə çevirir — məqsəd, istifadəçinin
+// hər dəfə özü rəqəmləri yozmasının əvəzinə, təcrübəli treyderin deyəcəyi kimi birbaşa bir cümlə
+// görməsidir. QEYD: bu, hələ də heuristik — real treyder sezgisini əvəz etmir, sadəcə mövcud
+// göstəriciləri daha oxunaqlı yekunlaşdırır.
+function verdict(r, calWin) {
+  const breakeven = r.breakevenProb ?? BREAKEVEN_PROB;
+  if (r.riskyBucket) return { tag: '🚫 KEÇ', note: 'Bu etibar aralığı tarixən breakeven-dən aşağı nəticə verib — bu setup-ı ötürmək daha ağıllıdır.' };
+  const strong = r.strength && r.strength.includes('güclü');
+  const mid = r.strength && r.strength.includes('orta');
+  if (strong && (calWin == null || calWin >= breakeven + 5)) return { tag: '✅ BURADAN GİR', note: 'Güclü uyğunluq, tarixi nəticə də dəstəkləyir (və ya hələ kifayət qədər tarixçə yoxdur).' };
+  if (mid) return { tag: '🤔 EHTİYATLA DÜŞÜN', note: 'Orta gücdə setup — kiçik stake ilə, ya da sadəcə izləyərək qərar verin.' };
+  return { tag: '👀 SADƏCƏ İZLƏ', note: 'Zəif meyl — real fürsət deyil, yalnız məlumat üçündür.' };
+}
 function fmt(x) { return x == null ? '--' : Number(x).toLocaleString('en-US', { maximumFractionDigits: 5 }); }
 function macroEmoji(t) { return t === 'up' ? '🟢 yuxarı' : t === 'down' ? '🔴 aşağı' : t ? '⚪ neytral' : '—'; }
 function rangeText(r) { return r ? `${fmt(r.lo)} – ${fmt(r.hi)}` : '—'; }
@@ -869,26 +944,34 @@ async function sendTelegramSignal(r) {
   const emoji = r.dir === 'CALL' ? '📈' : '📉';
   const dirText = r.dir === 'CALL' ? '🟢 LONG (AL)' : '🔴 SHORT (SAT)';
   const expText = r.expiry === '15m' ? '15 dəqiqə' : '5 dəqiqə';
-  const calWin = calibratedWinProb(r.confidence);
+  const calWin = calibratedWinProb(r.symbol, r.confidence);
+  const breakeven = r.breakevenProb ?? BREAKEVEN_PROB;
   const calText = calWin != null
-    ? `${calWin.toFixed(0)}% (breakeven: ${BREAKEVEN_PROB.toFixed(0)}%)`
+    ? `${calWin.toFixed(0)}% (breakeven: ${breakeven.toFixed(0)}%${r.livePayoutPct != null ? ', real ödəniş' : ', təxmini'})`
     : `hələ kifayət qədər tarixi nəticə yoxdur (min. ${MIN_SAMPLES_FOR_CALIBRATION})`;
   const autoTradeNote = DERIV_API_TOKEN
     ? '<i>Aşağıdakı düymə ilə bir kliklə Deriv-də əməliyyat açıla bilər.</i>'
     : '<i>Bu avtomatik texniki siqnaldır, maliyyə məsləhəti deyil. Auto-trade hələ aktiv deyil.</i>';
+  const v = verdict(r, calWin);
   const lines = [
-    `💎 <b>${r.symbol}</b>`,
+    `${v.tag}`,
+    `<i>${v.note}</i>`,
+    ``,
+    `💎 <b>${r.symbol}</b>   ${r.strength}`,
     `${dirText}   Etibar: <b>${r.confidence}%</b> ${confBar(r.confidence)}`,
     `📍 Giriş: <code>${fmt(r.price)}</code>`,
-    `⏱ Expiry: <b>${expText}</b> (${r.strength}${r.confluence != null ? `, 🟢${r.confluence}/3` : ''})`,
+    `⏱ Expiry: <b>${expText}</b>${r.confluence != null ? ` (🟢${r.confluence}/3 taymfreym uyğun)` : ''}`,
     `${emoji} Kalibrlənmiş nəticə: <b>${calText}</b>`,
+  ];
+  if (r.riskyBucket) lines.push('⚠️ <b>RİSKLİ</b> — bu etibar aralığında keçmiş nəticələr breakeven-dən aşağıdır, ehtiyatlı olun.');
+  lines.push(
     `📅 Makro (1D): ${macroEmoji(r.macroTrend)}`,
     `📊 4H aralıq: ${rangeText(r.range4h)}`,
     `📊 24H aralıq: ${rangeText(r.range24h)}`,
     `🧩 Səbəblər: ${r.reasons.join(', ')}`,
     `<i>ℹ️ Bu Rise/Fall (sabit ödənişli) opsiondur — açıq mövqe olmadığı üçün Stop Loss/Take Profit/Leverage tətbiq olunmur; müqavilə ${expText} sonra avtomatik bağlanır.</i>`,
     autoTradeNote,
-  ];
+  );
   const btnText = r.dir === 'CALL' ? '🟢 AL (CALL)' : '🔴 SAT (PUT)';
   const reply_markup = DERIV_API_TOKEN
     ? { inline_keyboard: [[{ text: btnText, callback_data: `B|${r.symbol}|${r.dir}|${expiryMinutes(r.expiry)}` }]] }
@@ -974,25 +1057,47 @@ function requireAdmin(req, res, next) {
 
 app.get('/api/stats', (req, res) => {
   const buckets = [...state.outcomeStats.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([bucket, s]) => {
+    .map(([k, s]) => {
+      const [symbol, bucketStr] = k.split('|');
+      const bucket = Number(bucketStr);
       const total = s.wins + s.losses;
+      const wilson = total ? +(wilsonLowerBound(s.wins, total) * 100).toFixed(1) : null;
       return {
+        symbol,
         bucket: `${bucket}-${bucket + CONF_BUCKET_SIZE - 1}%`,
         wins: s.wins,
         losses: s.losses,
         total,
         winRate: total ? +((100 * s.wins) / total).toFixed(1) : null,
+        wilsonLowerBound: wilson,
         calibrated: total >= MIN_SAMPLES_FOR_CALIBRATION,
       };
-    });
+    })
+    .sort((a, b) => a.symbol.localeCompare(b.symbol) || a.bucket.localeCompare(b.bucket));
   res.json({
     payoutPct: PAYOUT_PCT,
     breakevenProb: +BREAKEVEN_PROB.toFixed(1),
     minSamplesForCalibration: MIN_SAMPLES_FOR_CALIBRATION,
     pendingOutcomes: state.pendingOutcomes.length,
+    note: 'winRate xam nisbətdir; wilsonLowerBound (EV filtrində istifadə olunan) konservativ qiymətdir və az nümunədə winRate-dən aşağı olacaq — bu normaldır.',
     buckets,
   });
+});
+app.get('/api/indicator-stats', (req, res) => {
+  // Hansı konkret indikatorun (səbəbin) tarixən daha çox qazandırdığını/uduzdurduğunu göstərir.
+  // QEYD: bu, HƏLƏ scoring-ə avtomatik təsir etmir (kifayət qədər nümunə yığılana qədər riskli olardı) —
+  // sadəcə izləmə/qərar dəstəyi üçündür. Kifayət qədər data toplananda buradan çəki tənzimləməsi edilə bilər.
+  const rows = [...state.indicatorStats.entries()]
+    .map(([reason, s]) => {
+      const total = s.wins + s.losses;
+      return {
+        reason, wins: s.wins, losses: s.losses, total,
+        winRate: total ? +((100 * s.wins) / total).toFixed(1) : null,
+        wilsonLowerBound: total ? +(wilsonLowerBound(s.wins, total) * 100).toFixed(1) : null,
+      };
+    })
+    .sort((a, b) => b.total - a.total);
+  res.json({ minSamplesForTrust: MIN_SAMPLES_FOR_CALIBRATION, indicators: rows });
 });
 app.get('/api/state', (req, res) => {
   res.json({
