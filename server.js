@@ -12,6 +12,11 @@ const PORT = Number(process.env.PORT || 8788);
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
 const DERIV_API_TOKEN = (process.env.DERIV_API_TOKEN || '').trim();
 const DERIV_STAKE_AMOUNT = Number(process.env.DERIV_STAKE_AMOUNT || 1);
+// Telegram düyməsi basılanda mesajda göstərilən "Giriş" qiyməti ilə faktiki alış anındakı bazar
+// qiyməti arasındakı fərq (sürüşmə/slippage) faizlə burdan böyükdürsə, alış BLOKLANIR və istifadəçiyə
+// xəbərdarlıq göstərilir. Default 0 = deaktiv (yalnız fərqi göstərir, bloklamır). Aktiv etmək üçün
+// məs. 0.3 (yəni 0.3%) kimi bir dəyər qoy.
+const MAX_SLIPPAGE_PCT = Number(process.env.MAX_SLIPPAGE_PCT || 0);
 // Əvvəl yeni public endpoint, alınmasa köhnə endpoint (avtomatik növbələnir)
 const DERIV_WS_URLS = process.env.DERIV_WS_URL
   ? [process.env.DERIV_WS_URL]
@@ -732,7 +737,19 @@ function tradingRequest(payload, timeoutMs = 10000) {
 }
 
 // Yeni API: birbaşa "buy" yoxdur, əvvəlcə "proposal" (qiymət təklifi), sonra onun id-si ilə "buy"
-async function buyContract(symbol, dir, durationMin) {
+// expectedPrice: siqnal mesajında göstərilən "Giriş" qiyməti (Telegram düyməsindən gəlir).
+// Proposal cavabındakı "spot" — sorğunun getdiyi AN bazarda olan həqiqi qiymətdir; bu ikisi
+// arasındakı fərq (sürüşmə/slippage) hesablanır. MAX_SLIPPAGE_PCT > 0 və fərq bu həddi keçirsə,
+// alış həyata keçirilmədən SlippageError atılır (heç bir pul xərclənmir).
+class SlippageError extends Error {
+  constructor(expected, actual, diffPct) {
+    super(`Qiymət çox dəyişib (mesajdakı: ${expected}, indiki: ${actual}, fərq: ${diffPct.toFixed(3)}%)`);
+    this.name = 'SlippageError';
+    this.expected = expected; this.actual = actual; this.diffPct = diffPct;
+  }
+}
+
+async function buyContract(symbol, dir, durationMin, expectedPrice) {
   const proposalMsg = await tradingRequest({
     proposal: 1,
     amount: DERIV_STAKE_AMOUNT,
@@ -745,8 +762,16 @@ async function buyContract(symbol, dir, durationMin) {
   });
   const p = proposalMsg.proposal;
   if (!p?.id) throw new Error('Proposal alınmadı');
+  const actualSpot = Number(p.spot ?? p.underlying_spot);
+  let diffPct = null;
+  if (expectedPrice && Number.isFinite(actualSpot)) {
+    diffPct = Math.abs((actualSpot - expectedPrice) / expectedPrice) * 100;
+    if (MAX_SLIPPAGE_PCT > 0 && diffPct > MAX_SLIPPAGE_PCT) {
+      throw new SlippageError(expectedPrice, actualSpot, diffPct);
+    }
+  }
   const buyMsg = await tradingRequest({ buy: p.id, price: p.ask_price });
-  return buyMsg.buy;
+  return { ...buyMsg.buy, expectedPrice: expectedPrice ?? null, actualSpot: Number.isFinite(actualSpot) ? actualSpot : null, diffPct };
 }
 
 // === Real vaxtda ödəniş faizi ===
@@ -974,7 +999,7 @@ async function sendTelegramSignal(r) {
   );
   const btnText = r.dir === 'CALL' ? '🟢 AL (CALL)' : '🔴 SAT (PUT)';
   const reply_markup = DERIV_API_TOKEN
-    ? { inline_keyboard: [[{ text: btnText, callback_data: `B|${r.symbol}|${r.dir}|${expiryMinutes(r.expiry)}` }]] }
+    ? { inline_keyboard: [[{ text: btnText, callback_data: `B|${r.symbol}|${r.dir}|${expiryMinutes(r.expiry)}|${r.price}` }]] }
     : undefined;
   await telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: lines.join('\n'), parse_mode: 'HTML', reply_markup });
 }
@@ -996,14 +1021,18 @@ async function handleCallbackQuery(cq) {
         await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: `🛑 Bloklanıb: ${state.haltReason || 'kill-switch aktiv'}`, show_alert: true });
         return;
       }
-      const [, symbol, dir, durStr] = data.split('|');
+      const [, symbol, dir, durStr, priceStr] = data.split('|');
       const durMin = Number(durStr) || 15;
-      const buy = await buyContract(symbol, dir, durMin);
+      const expectedPrice = priceStr ? Number(priceStr) : null;
+      const buy = await buyContract(symbol, dir, durMin, expectedPrice);
       const acc = tradingIsVirtual ? 'DEMO' : 'REAL';
       const closeBtn = { inline_keyboard: [[{ text: '🔴 Bağla (indi sat)', callback_data: `S|${buy.contract_id}` }]] };
+      const slipLine = buy.diffPct != null
+        ? `\n💹 Mesajdakı qiymət: ${fmt(buy.expectedPrice)} → Faktiki giriş: ${fmt(buy.actualSpot)} (fərq: ${buy.diffPct.toFixed(3)}%)`
+        : '';
       await telegram('editMessageText', {
         chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-        text: `${baseText}\n\n✅ <b>ALINDI (${acc})</b> — stake: ${DERIV_STAKE_AMOUNT} ${tradingCurrency || ''} · #${buy.contract_id}`,
+        text: `${baseText}\n\n✅ <b>ALINDI (${acc})</b> — stake: ${DERIV_STAKE_AMOUNT} ${tradingCurrency || ''} · #${buy.contract_id}${slipLine}`,
         reply_markup: closeBtn,
       });
       await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: '✅ Alındı' });
@@ -1018,7 +1047,15 @@ async function handleCallbackQuery(cq) {
     }
   } catch (e) {
     console.error('[telegram] callback xətası:', e.message);
-    await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: `❌ Xəta: ${e.message}`, show_alert: true });
+    if (e.name === 'SlippageError') {
+      await telegram('answerCallbackQuery', {
+        callback_query_id: cq.id,
+        text: `⚠️ Qiymət çox dəyişib, alış edilmədi.\nMesajdakı: ${fmt(e.expected)}\nİndiki: ${fmt(e.actual)}\nFərq: ${e.diffPct.toFixed(3)}% (limit: ${MAX_SLIPPAGE_PCT}%)`,
+        show_alert: true,
+      });
+    } else {
+      await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: `❌ Xəta: ${e.message}`, show_alert: true });
+    }
   }
 }
 
