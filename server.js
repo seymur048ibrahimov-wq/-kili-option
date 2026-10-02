@@ -11,26 +11,13 @@ const PORT = Number(process.env.PORT || 8788);
 // === Deriv bağlantısı ===
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
 const DERIV_API_TOKEN = (process.env.DERIV_API_TOKEN || '').trim();
-const DERIV_STAKE_AMOUNT = Number(process.env.DERIV_STAKE_AMOUNT || 10);
-
-// === Risk idarəetməsi (Multiplier müqavilələri: TP/SL birbaşa Deriv serverində işləyir) ===
-const TP_MIN_PCT = Number(process.env.TP_MIN_PCT || 20);      // stake-in %-i ilə minimum qazanc hədəfi
-const TP_MAX_PCT = Number(process.env.TP_MAX_PCT || 40);      // stake-in %-i ilə maksimum qazanc hədəfi
-const SL_PCT = Number(process.env.SL_PCT || 35);              // stake-in %-i ilə avtomatik stop-loss
-const TP_CONF_HI = Number(process.env.TP_CONF_HI || 70);      // bu etibar və yuxarıda TP = TP_MAX_PCT
-const TARGET_ATR_PNL = Number(process.env.TARGET_ATR_PNL || 0.20); // 1 ATR(15m) hərəkəti ≈ stake-in 20%-i olsun deyə multiplier seçilir
-const MULT_DEFAULT = Number(process.env.MULT_DEFAULT || 100); // multiplier siyahısı oxunmasa istifadə olunur
-const MAX_OPEN_TRADES = Number(process.env.MAX_OPEN_TRADES || 5);
-const DAILY_LOSS_LIMIT = Number(process.env.DAILY_LOSS_LIMIT || DERIV_STAKE_AMOUNT * 5); // gündəlik zərər limiti ($)
-const MIN_CONFIDENCE_OTHER = Number(process.env.MIN_CONFIDENCE_OTHER || 30); // forex/kripto/əmtəə/step üçün daha sərt hədd
-const MAX_SYMBOLS = Number(process.env.MAX_SYMBOLS || 80);
-const SUB_GAP_MS = Number(process.env.SUB_GAP_MS || 250);     // Deriv rate-limit-ə düşməmək üçün abunə sorğuları arası fasilə
-const flag = (name, def = '1') => String(process.env[name] ?? def) !== '0';
-const INCLUDE_FOREX = flag('INCLUDE_FOREX');
-const INCLUDE_CRYPTO = flag('INCLUDE_CRYPTO');
-const INCLUDE_COMMODITIES = flag('INCLUDE_COMMODITIES');
-const INCLUDE_SYNTH_200_500 = flag('INCLUDE_SYNTH_200_500'); // adında 200/300/400/500 olan sintetik indekslər (Step, Boom/Crash, Range Break...)
-const EXTRA_SYMBOLS = (process.env.EXTRA_SYMBOLS || '').split(',').map(x => x.trim()).filter(Boolean);
+const DERIV_STAKE_AMOUNT = Number(process.env.DERIV_STAKE_AMOUNT || 20);
+// === Avto-trade ===
+// Hər siqnalda avtomatik alış (düymə basmaq lazım deyil). Söndürmək üçün: AUTO_TRADE=false
+const AUTO_TRADE = (process.env.AUTO_TRADE || 'true').toLowerCase() !== 'false';
+const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 35);        // zərər stake-in 35%-nə çatanda bağla
+const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 20);    // mənfəət 20%-ə çatanda bağla (20-40% və yuxarı hamısı daxildir)
+const POSITION_CHECK_MS = Number(process.env.POSITION_CHECK_MS || 3000);
 // Əvvəl yeni public endpoint, alınmasa köhnə endpoint (avtomatik növbələnir)
 const DERIV_WS_URLS = process.env.DERIV_WS_URL
   ? [process.env.DERIV_WS_URL]
@@ -52,7 +39,9 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
 const STATE_FILE = process.env.STATE_FILE || '/tmp/deriv13-state.json';
 
-const DEFAULT_SYMBOLS = ['R_10','R_25','R_50','R_75','R_100'];
+// GOLD və OIL — Deriv-in "commodities" bazarından ada görə avtomatik tapılır (aşağıda)
+const DEFAULT_SYMBOLS = ['R_10','R_25','R_50','R_75','R_100','GOLD','OIL'];
+const COMMODITY_PATTERNS = { GOLD: /\bgold\b|xau/i, OIL: /\boil\b|brent|crude|wti|bro/i };
 const rawSyms = (process.env.DERIV_SYMBOLS || '').trim();
 const symbols = rawSyms ? rawSyms.split(',').map(s => s.trim()).filter(Boolean) : DEFAULT_SYMBOLS.slice();
 
@@ -76,17 +65,7 @@ const state = {
   clients: new Set(),
   activeSymbols: symbols.slice(),
   availableSymbols: [],
-  symMeta: new Map(),   // simvol -> { market, name, open, suspended }
-  symGroup: new Map(),  // simvol -> base|forex|crypto|commodity|synthetic|extra
 };
-const openTrades = new Map();   // contract_id -> { symbol, dir, stake, tp, sl, mult, openedAt }
-const pendingBuys = new Set();  // eyni simvola ikiqat klikin qarşısını alır
-let dailyPnl = { day: '', pnl: 0 };
-function resetDailyIfNeeded() {
-  const day = new Date().toISOString().slice(0, 10);
-  if (dailyPnl.day !== day) dailyPnl = { day, pnl: 0 };
-}
-const round2 = (x) => Math.round(x * 100) / 100;
 
 function saveState() {
   const dump = {
@@ -284,71 +263,6 @@ function fullAnalysis(symbol){
 
 function getCandles(symbol, tf) { return state.candles.get(key(symbol, tf)) || []; }
 
-// === Simvol qrupları və yoxlamalar ===
-const nameOfSym = (s) => (s && (s.underlying_symbol_name || s.display_name || s.symbol_name)) || '';
-function classifyExtra(s) {
-  const sym = (s && (s.symbol || s.underlying_symbol)) || '';
-  const name = nameOfSym(s);
-  const market = s.market || '';
-  if (INCLUDE_FOREX && market === 'forex' && /^frx/i.test(sym)) return 'forex';           // yalnız real cütlüklər (WLD basket indeksləri xaric)
-  if (INCLUDE_CRYPTO && market === 'cryptocurrency') return 'crypto';
-  if (INCLUDE_COMMODITIES && market === 'commodities' &&
-      (/XAU|XAG|BRO|WTI|OIL/i.test(sym) || /gold|silver|oil|brent|crude/i.test(name))) return 'commodity';
-  if (INCLUDE_SYNTH_200_500 && market === 'synthetic_index' && /\b(200|300|400|500)\b/.test(name)) return 'synthetic';
-  return null;
-}
-function selectExtraSymbols(list) {
-  const out = [];
-  for (const s of list) {
-    const sym = (s.symbol || s.underlying_symbol);
-    const g = sym && classifyExtra(s);
-    if (g) out.push({ symbol: sym, group: g });
-  }
-  return out;
-}
-function updateSymMeta(list) {
-  for (const s of list) {
-    const sym = s.symbol || s.underlying_symbol;
-    if (!sym) continue;
-    state.symMeta.set(sym, {
-      market: s.market || '',
-      name: nameOfSym(s),
-      open: s.exchange_is_open === undefined ? true : !!s.exchange_is_open,
-      suspended: !!s.is_trading_suspended,
-    });
-  }
-}
-const symGroupOf = (sym) => state.symGroup.get(sym) || 'base';
-function marketTradable(symbol) {
-  const m = state.symMeta.get(symbol);
-  return !m || (m.open && !m.suspended);
-}
-// Köhnəlmiş data (bazar bağlıdır / axın kəsilib) üzrə siqnal verilməsin
-function isFresh(symbol) {
-  const now = Date.now();
-  const c15 = getCandles(symbol, '15m').at(-1), h1 = getCandles(symbol, TREND_TF).at(-1);
-  return !!c15 && !!h1 && now - c15.t < 2 * 900 * 1000 && now - h1.t < 2 * 3600 * 1000;
-}
-// Etibar yüksəldikcə TP hədəfi TP_MIN_PCT-dən TP_MAX_PCT-ə qədər artır
-function tpPctFor(confidence) {
-  const lo = MIN_CONFIDENCE, hi = Math.max(TP_CONF_HI, lo + 1);
-  const t = Math.min(1, Math.max(0, ((confidence || 0) - lo) / (hi - lo)));
-  return TP_MIN_PCT + t * (TP_MAX_PCT - TP_MIN_PCT);
-}
-function pickMultiplier(range, desired) {
-  const list = (range || []).map(Number).filter((x) => x > 0);
-  if (!list.length) return null;
-  let best = list[0], bd = Infinity;
-  for (const m of list) { const d = Math.abs(Math.log(m / desired)); if (d < bd) { bd = d; best = m; } }
-  return best;
-}
-// Simvolun cari dəyişkənliyinə görə ideal multiplier: 1 ATR(15m) ≈ stake-in TARGET_ATR_PNL hissəsi
-function desiredMultiplier(symbol) {
-  const a = state.lastAnalysis.get(symbol);
-  if (!a || !a.atr || !a.price) return MULT_DEFAULT;
-  return TARGET_ATR_PNL / (a.atr / a.price);
-}
-
 let derivWs = null;
 let reqSeq = 1;
 let pingTimer = null;
@@ -373,28 +287,6 @@ function connectDeriv() {
   derivWs = new WebSocket(wsUrl);
   const ws = derivWs;
   let gotCandles = false;
-  let subscribedOnce = false;
-  let pingN = 0;
-  const queue = [];        // abunə sorğu növbəsi — rate-limit-dən qaçmaq üçün tədrici göndərilir
-  let pumping = false;
-  const pump = () => {
-    if (ws !== derivWs || ws.readyState !== WebSocket.OPEN) { pumping = false; return; }
-    const job = queue.shift();
-    if (!job) { pumping = false; return; }
-    const id = reqSeq++;
-    reqMeta.set(id, { symbol: job.symbol, tf: job.tf, tries: job.tries });
-    ws.send(JSON.stringify({
-      ticks_history: job.symbol, style: 'candles', granularity: GRANULARITY[job.tf],
-      count: 300, end: 'latest', subscribe: 1, req_id: id,
-    }));
-    setTimeout(pump, SUB_GAP_MS);
-  };
-  const startPump = (delay = 0) => { if (pumping) return; pumping = true; setTimeout(pump, delay); };
-  const requeue = (m) => {
-    if ((m.tries || 0) >= 5) { console.error(`[deriv] ${m.symbol} ${m.tf} — 5 cəhddən sonra vaz keçildi`); return; }
-    queue.push({ symbol: m.symbol, tf: m.tf, tries: (m.tries || 0) + 1 });
-    startPump(5000);
-  };
   let invalidCount = 0;
   let opened = false;
   let rotated = false;
@@ -415,20 +307,26 @@ function connectDeriv() {
     // Deriv boş qalan bağlantını bağlayır — hər 30 san ping
     clearInterval(pingTimer);
     pingTimer = setInterval(() => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      ws.send(JSON.stringify({ ping: 1 }));
-      // Hər ~5 dəqiqədə bazarın açıq/bağlı statusunu yenilə
-      if (++pingN % 10 === 0) ws.send(JSON.stringify({ active_symbols: 'brief', req_id: reqSeq++ }));
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ping: 1 }));
     }, 30000);
   });
 
   function subscribeCandles(symbolList) {
     for (const symbol of symbolList) {
-      // 5m təsdiq çərçivəsi yalnız əsas simvollar üçün; əlavə bazarlarda 15m+1h kifayətdir (abunə sayı azalır)
-      const tfs = symGroupOf(symbol) === 'base' ? ALL_TFS : [...TIMEFRAMES, TREND_TF];
-      for (const tf of tfs) queue.push({ symbol, tf, tries: 0 });
+      for (const tf of ALL_TFS) {
+        const id = reqSeq++;
+        reqMeta.set(id, { symbol, tf });
+        ws.send(JSON.stringify({
+          ticks_history: symbol,
+          style: 'candles',
+          granularity: GRANULARITY[tf],
+          count: 300,
+          end: 'latest',
+          subscribe: 1,
+          req_id: id,
+        }));
+      }
     }
-    startPump();
   }
 
   // Cavabdan (symbol, tf) tapır: req_id → subscription.id → echo_req → sahələr
@@ -454,7 +352,6 @@ function connectDeriv() {
     if (msg.error) {
       const m = msg.req_id != null ? reqMeta.get(msg.req_id) : null;
       console.error('[deriv] xəta:', msg.error.message, m ? `(${m.symbol} ${m.tf})` : '');
-      if (m && (msg.error.code === 'RateLimit' || /rate.?limit|too many|exceeded/i.test(msg.error.message || ''))) { requeue(m); return; }
       if (/invalid/i.test(msg.error.message || '') && m) {
         invalidCount++;
         if (!gotCandles && invalidCount >= state.activeSymbols.length * ALL_TFS.length) {
@@ -470,9 +367,8 @@ function connectDeriv() {
       const nameOf = (s) => s.underlying_symbol_name || s.display_name || '';
       const synthetic = list.filter(s => s.market === 'synthetic_index');
       state.availableSymbols = all;
-      updateSymMeta(list);
-      if (subscribedOnce) return; // dövri yeniləmə: yalnız bazar statusu
       console.log(`[deriv] cəmi ${all.length} simvol, ${synthetic.length} sintetik`);
+      console.log('[deriv] commodities:', list.filter(s => s.market === 'commodities').map(s => `${symOf(s)}="${nameOf(s)}"`).join(' | ') || '(yoxdur)');
       if (!list.length) {
         console.warn('[deriv] xam cavab:', String(raw).slice(0, 300));
       } else {
@@ -490,17 +386,14 @@ function connectDeriv() {
           const hit = list.find(s => re.test(nameOf(s).trim()));
           if (hit) { console.log(`[deriv] ${want} → ${symOf(hit)} (ad ilə tapıldı)`); resolved.push(symOf(hit)); continue; }
         }
+        const pat = COMMODITY_PATTERNS[want.toUpperCase()];
+        if (pat) {
+          const hit = list.find(s => s.market === 'commodities' && (pat.test(nameOf(s)) || pat.test(symOf(s) || '')));
+          if (hit) { console.log(`[deriv] ${want} → ${symOf(hit)} ("${nameOf(hit)}")`); resolved.push(symOf(hit)); continue; }
+        }
         console.warn(`[deriv] simvol tapılmadı: ${want}`);
       }
-      for (const sym of resolved) state.symGroup.set(sym, 'base');
-      // Əlavə bazarlar: forex, kripto, qızıl/gümüş/neft, 200-500 indekslər + əl ilə EXTRA_SYMBOLS
-      const extras = selectExtraSymbols(list);
-      for (const sym of EXTRA_SYMBOLS) if (all.includes(sym) && !extras.some((e) => e.symbol === sym)) extras.push({ symbol: sym, group: 'extra' });
-      for (const e of extras) { if (!state.symGroup.has(e.symbol)) state.symGroup.set(e.symbol, e.group); resolved.push(e.symbol); }
-      let finalSymbols = [...new Set(resolved)];
-      if (finalSymbols.length > MAX_SYMBOLS) { console.warn(`[deriv] ${finalSymbols.length} simvol tapıldı, MAX_SYMBOLS=${MAX_SYMBOLS} ilə məhdudlaşdırıldı`); finalSymbols = finalSymbols.slice(0, MAX_SYMBOLS); }
-      const counts = {}; for (const sym of finalSymbols) { const g = symGroupOf(sym); counts[g] = (counts[g] || 0) + 1; }
-      console.log('[deriv] qruplar:', JSON.stringify(counts));
+      const finalSymbols = [...new Set(resolved)];
 
       if (!finalSymbols.length) {
         rotate('heç bir simvol tapılmadı');
@@ -508,7 +401,6 @@ function connectDeriv() {
       }
       state.activeSymbols = finalSymbols;
       console.log(`[deriv] İstifadə olunan simvollar: ${finalSymbols.join(', ')}`);
-      subscribedOnce = true;
       subscribeCandles(finalSymbols);
       return;
     }
@@ -542,7 +434,6 @@ function connectDeriv() {
   ws.on('close', () => {
     state.derivConnected = false;
     clearInterval(pingTimer);
-    queue.length = 0;
     if (!opened && DERIV_WS_URLS.length > 1) urlIdx++;
     const delay = reconnectDelay;
     console.log(`[deriv] bağlantı kəsildi, ${Math.round(delay / 1000)} saniyə sonra yenidən qoşulacaq`);
@@ -621,8 +512,6 @@ async function connectTradingWs() {
       tradingAuthError = null;
       tradingAuthorized = true;
       console.log(`[trading] qoşuldu — hesab: ${tradingAccountId} (${tradingIsVirtual ? 'DEMO' : 'REAL'}), valyuta: ${tradingCurrency}`);
-      // Yenidən qoşulmadan sonra açıq müqavilələrin izlənməsini bərpa et
-      for (const id of openTrades.keys()) watchContract(id);
       clearInterval(tradingPingTimer);
       tradingPingTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ping: 1 }));
@@ -630,7 +519,6 @@ async function connectTradingWs() {
     });
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw); } catch { return; }
-      if (msg.msg_type === 'proposal_open_contract') { try { handleOpenContract(msg); } catch (e) { console.error('[trading] open_contract xətası:', e.message); } }
       if (msg.req_id && tradingPending.has(msg.req_id)) {
         const p = tradingPending.get(msg.req_id);
         tradingPending.delete(msg.req_id);
@@ -669,85 +557,118 @@ function tradingRequest(payload, timeoutMs = 10000) {
   });
 }
 
-// Multiplier müqaviləsi üçün icazə verilən multiplier siyahısı.
-// Qaytarır: massiv (dəstəklənir) | null (dəqiq dəstəklənmir) | undefined (cavab oxuna bilmədi — naməlum)
-const mulCache = new Map();
-async function getMultiplierRange(symbol) {
-  const c = mulCache.get(symbol);
-  if (c && Date.now() - c.ts < 6 * 3600 * 1000) return c.range;
-  const msg = await tradingRequest({ contracts_for: symbol });
-  const avail = msg?.contracts_for?.available;
-  if (!Array.isArray(avail) || !avail.length) return undefined;
-  const mult = avail.find((a) => /^MULT(UP|DOWN)$/i.test(a.contract_type || '') || String(a.contract_category || '').toLowerCase() === 'multiplier');
-  const range = mult && Array.isArray(mult.multiplier_range) && mult.multiplier_range.length ? mult.multiplier_range.map(Number) : (mult ? undefined : null);
-  mulCache.set(symbol, { range, ts: Date.now() });
-  return range;
-}
-
-// TP/SL-li əməliyyat: stake=10$ → TP 20–40% (etibara görə), SL 35% — hər ikisi Deriv serverində avtomatik icra olunur
-async function buyMultiplier(symbol, dir, confidence) {
-  if (pendingBuys.has(symbol)) throw new Error(`${symbol} üzrə alış artıq icra olunur`);
-  for (const t of openTrades.values()) if (t.symbol === symbol) throw new Error(`${symbol} üzrə artıq açıq əməliyyat var`);
-  if (openTrades.size >= MAX_OPEN_TRADES) throw new Error(`Açıq əməliyyat limiti (${MAX_OPEN_TRADES}) dolub`);
-  resetDailyIfNeeded();
-  if (dailyPnl.pnl <= -DAILY_LOSS_LIMIT) throw new Error(`Gündəlik zərər limiti (${DAILY_LOSS_LIMIT}) çatıb — bu gün yeni əməliyyat bloklanıb`);
-  pendingBuys.add(symbol);
-  try {
-    const range = await getMultiplierRange(symbol);
-    if (range === null) throw new Error(`${symbol} üçün TP/SL-li (multiplier) müqavilə mövcud deyil`);
-    const mult = range ? pickMultiplier(range, desiredMultiplier(symbol)) : MULT_DEFAULT;
-    const tpPct = tpPctFor(confidence);
-    const tp = round2(DERIV_STAKE_AMOUNT * tpPct / 100);
-    const sl = round2(DERIV_STAKE_AMOUNT * SL_PCT / 100);
-    const proposalMsg = await tradingRequest({
-      proposal: 1,
-      amount: DERIV_STAKE_AMOUNT,
-      basis: 'stake',
-      contract_type: dir === 'CALL' ? 'MULTUP' : 'MULTDOWN',
-      currency: tradingCurrency || 'USD',
-      underlying_symbol: symbol,
-      multiplier: mult,
-      limit_order: { take_profit: tp, stop_loss: sl },
-    });
-    const p = proposalMsg.proposal;
-    if (!p?.id) throw new Error('Proposal alınmadı');
-    const buyMsg = await tradingRequest({ buy: p.id, price: p.ask_price });
-    const buy = buyMsg.buy;
-    openTrades.set(String(buy.contract_id), { symbol, dir, stake: DERIV_STAKE_AMOUNT, tp, sl, mult, openedAt: Date.now() });
-    watchContract(buy.contract_id);
-    return { buy, mult, tp, sl, tpPct };
-  } finally {
-    pendingBuys.delete(symbol);
-  }
+// Yeni API: birbaşa "buy" yoxdur, əvvəlcə "proposal" (qiymət təklifi), sonra onun id-si ilə "buy"
+async function buyContract(symbol, dir, durationMin) {
+  const proposalMsg = await tradingRequest({
+    proposal: 1,
+    amount: DERIV_STAKE_AMOUNT,
+    basis: 'stake',
+    contract_type: dir,
+    currency: tradingCurrency || 'USD',
+    underlying_symbol: symbol,
+    duration: durationMin,
+    duration_unit: 'm',
+  });
+  const p = proposalMsg.proposal;
+  if (!p?.id) throw new Error('Proposal alınmadı');
+  const buyMsg = await tradingRequest({ buy: p.id, price: p.ask_price });
+  return buyMsg.buy;
 }
 
 async function sellContract(contractId) {
-  const msg = await tradingRequest({ sell: Number(contractId), price: 0 });
+  const msg = await tradingRequest({ sell: contractId, price: 0 });
   return msg.sell;
 }
 
-// Açıq müqaviləni izləyir: TP/SL işləyib bağlananda Telegram-a xəbər verir, gündəlik P&L-i yeniləyir
-function watchContract(id) {
-  tradingRequest({ proposal_open_contract: 1, contract_id: Number(id), subscribe: 1 })
-    .catch((e) => console.error(`[trading] #${id} izləmə xətası:`, e.message));
+// === Avto-trade mühərriki ===
+// QEYD: Deriv-in CALL/PUT kontraktlarında daxili stop-loss/take-profit YOXDUR (yalnız multiplier-lərdə var).
+// Ona görə hər 3 saniyədən bir açıq kontraktın cari dəyərini yoxlayıb, SL/TP həddinə çatanda
+// "sell" (erkən satış) ilə özümüz bağlayırıq.
+const openPositions = new Map();   // contract_id -> { symbol, dir, stake, openedAt, busy }
+const openSymbols = new Set();     // eyni simvolda ikinci əməliyyat açılmasın
+
+async function autoTrade(r) {
+  if (!AUTO_TRADE || !DERIV_API_TOKEN) return;
+  if (openSymbols.has(r.symbol)) {
+    console.log(`[auto] ${r.symbol} üçün açıq əməliyyat var — yeni alış keçildi`);
+    return;
+  }
+  openSymbols.add(r.symbol);
+  try {
+    const buy = await buyContract(r.symbol, r.dir, expiryMinutes(r.expiry));
+    const id = String(buy.contract_id);
+    const stake = Number(buy.buy_price) || DERIV_STAKE_AMOUNT;
+    openPositions.set(id, { symbol: r.symbol, dir: r.dir, stake, openedAt: Date.now(), busy: false });
+    const acc = tradingIsVirtual ? 'DEMO' : 'REAL ⚠️';
+    console.log(`[auto] alındı ${r.symbol} ${r.dir} stake=${stake} #${id}`);
+    await telegram('sendMessage', {
+      chat_id: TELEGRAM_CHAT_ID, parse_mode: 'HTML',
+      text: `🤖 <b>AVTO-ALIŞ (${acc})</b>\n${r.symbol} — <b>${r.dir}</b>\nStake: ${stake} ${tradingCurrency || ''} · #${id}\nSL: -${STOP_LOSS_PCT}% · TP: +${TAKE_PROFIT_PCT}%`,
+    });
+  } catch (e) {
+    openSymbols.delete(r.symbol);
+    console.error(`[auto] alış xətası (${r.symbol}):`, e.message);
+    await telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: `❌ Avto-alış alınmadı (${r.symbol} ${r.dir}): ${e.message}` });
+  }
 }
-function handleOpenContract(msg) {
-  const c = msg.proposal_open_contract;
-  if (!c) return;
-  const id = String(c.contract_id);
-  const t = openTrades.get(id);
-  if (!t) return;
-  const closed = c.is_sold === 1 || c.is_sold === true || ['sold', 'won', 'lost'].includes(c.status);
-  if (!closed) return;
-  openTrades.delete(id);
-  const profit = Number(c.profit);
-  resetDailyIfNeeded();
-  if (Number.isFinite(profit)) dailyPnl.pnl += profit;
-  if (msg.subscription?.id) tradingRequest({ forget: msg.subscription.id }).catch(() => {});
-  const pct = Number.isFinite(profit) ? (profit / t.stake) * 100 : null;
+
+function closePosition(id, pos, profit, why) {
+  openPositions.delete(id);
+  openSymbols.delete(pos.symbol);
+  const pct = pos.stake ? (profit / pos.stake) * 100 : 0;
+  const icon = profit > 0 ? '✅' : profit < 0 ? '🔻' : '➖';
   const sign = profit >= 0 ? '+' : '';
-  const text = `${profit >= 0 ? '🟢' : '🔴'} <b>${t.symbol}</b> ${t.dir === 'CALL' ? 'CALL' : 'PUT'} bağlandı: <b>${sign}${Number.isFinite(profit) ? profit.toFixed(2) : '?'} ${tradingCurrency || ''}</b>${pct != null ? ` (${sign}${pct.toFixed(0)}%)` : ''}\nBu gün cəmi: ${dailyPnl.pnl >= 0 ? '+' : ''}${dailyPnl.pnl.toFixed(2)} · açıq: ${openTrades.size}`;
-  if (TELEGRAM_CHAT_ID) telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' });
+  console.log(`[auto] bağlandı ${pos.symbol} #${id} (${why}) ${sign}${profit.toFixed(2)}`);
+  return telegram('sendMessage', {
+    chat_id: TELEGRAM_CHAT_ID, parse_mode: 'HTML',
+    text: `${icon} <b>${why}</b> — ${pos.symbol} ${pos.dir}\nNəticə: <b>${sign}${profit.toFixed(2)} ${tradingCurrency || ''}</b> (${sign}${pct.toFixed(1)}%) · #${id}`,
+  });
+}
+
+async function checkPositions() {
+  if (!openPositions.size || !tradingAuthorized) return;
+  for (const [id, pos] of [...openPositions]) {
+    if (pos.busy) continue;
+    // Təhlükəsizlik: 2 saatdan çox "açıq" qalan qeyd (məs. xəta ucbatından) təmizlənir
+    if (Date.now() - pos.openedAt > 2 * 60 * 60 * 1000) { openPositions.delete(id); openSymbols.delete(pos.symbol); continue; }
+    pos.busy = true;
+    try {
+      const m = await tradingRequest({ proposal_open_contract: 1, contract_id: Number(id) }, 8000);
+      const c = m.proposal_open_contract;
+      if (!c) continue;
+      const stake = Number(c.buy_price) || pos.stake;
+      pos.stake = stake;
+
+      // Müddət özü bitibsə (expiry) — nəticəni bildir
+      if (c.is_sold || c.is_expired || c.status === 'won' || c.status === 'lost') {
+        const profit = c.profit != null ? Number(c.profit) : (Number(c.sell_price || 0) - stake);
+        await closePosition(id, pos, profit, c.status === 'won' ? 'MÜDDƏT BİTDİ (qazanc)' : c.status === 'lost' ? 'MÜDDƏT BİTDİ (zərər)' : 'BAĞLANDI');
+        continue;
+      }
+
+      const profit = c.profit != null ? Number(c.profit) : (Number(c.bid_price) - stake);
+      const pct = (profit / stake) * 100;
+      let why = null;
+      if (pct <= -STOP_LOSS_PCT) why = 'STOP LOSS';
+      else if (pct >= TAKE_PROFIT_PCT) why = 'TAKE PROFIT';
+
+      if (why && c.is_valid_to_sell !== 0) {
+        const sell = await sellContract(id);
+        const realProfit = sell && sell.sold_for != null ? Number(sell.sold_for) - stake : profit;
+        await closePosition(id, pos, realProfit, why);
+      }
+    } catch (e) {
+      console.error(`[auto] yoxlama xətası #${id}:`, e.message);
+    } finally {
+      pos.busy = false;
+    }
+  }
+}
+setInterval(() => { checkPositions().catch((e) => console.error('[auto] checkPositions:', e.message)); }, POSITION_CHECK_MS);
+
+function expiryMinutes(expiry) {
+  const m = /^(\d+)/.exec(expiry || '');
+  return m ? Number(m[1]) : 15;
 }
 
 // Watchdog: WS "açıq" görünsə də Deriv bəzən data axınını səssizcə kəsir.
@@ -773,15 +694,11 @@ function runAnalysis(symbol) {
   try { r = fullAnalysis(symbol); }
   catch (e) { console.error(`[analiz] ${symbol} xətası:`, e.message); return; }
   if (!r) return;
-  r.group = symGroupOf(symbol);
   state.lastAnalysis.set(symbol, r);
   broadcast({ type: 'analysis', data: r });
 
   if (!state.scannerEnabled) return;
-  const minConf = r.group === 'base' ? MIN_CONFIDENCE : Math.max(MIN_CONFIDENCE, MIN_CONFIDENCE_OTHER);
-  if (r.dir === 'WAIT' || r.confidence < minConf) { state.pendingDir.delete(symbol); return; }
-  // Bazar bağlıdır / dayandırılıb / data köhnədir → siqnal yoxdur
-  if (!marketTradable(symbol) || !isFresh(symbol)) { state.pendingDir.delete(symbol); return; }
+  if (r.dir === 'WAIT' || r.confidence < MIN_CONFIDENCE) { state.pendingDir.delete(symbol); return; }
 
   // Ən azı 2 ardıcıl analiz eyni istiqaməti təsdiqləməlidir — tək tiklik "yanlış sıçrayış"
   // (qiymətin bir anlıq irəli-geri hərəkəti) siqnal doğurmasın deyə
@@ -808,6 +725,7 @@ function runAnalysis(symbol) {
   saveState();
   broadcast({ type: 'signal', data: entry });
   sendTelegramSignal(r);
+  autoTrade(r);
 }
 
 async function telegram(method, body, attempt = 1) {
@@ -838,39 +756,28 @@ async function telegram(method, body, attempt = 1) {
 }
 function confBar(pct) { const filled = Math.round((pct || 0) / 10); return '█'.repeat(filled) + '░'.repeat(10 - filled); }
 function fmt(x) { return x == null ? '--' : Number(x).toLocaleString('en-US', { maximumFractionDigits: 5 }); }
-const GROUP_EMOJI = { base: '🎲', forex: '💱', crypto: '🪙', commodity: '🥇', synthetic: '📊', extra: '➕' };
 async function sendTelegramSignal(r) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) { console.error('[telegram] TOKEN/CHAT_ID boşdur, siqnal göndərilmədi'); return; }
   const emoji = r.dir === 'CALL' ? '📈' : '📉';
   const dirText = r.dir === 'CALL' ? 'CALL (yuxarı)' : 'PUT (aşağı)';
+  const expText = r.expiry === '15m' ? '15 dəqiqə' : '5 dəqiqə';
   const confluenceText = r.confluence != null ? ` — 🟢${r.confluence}/3` : '';
-  const tpPct = tpPctFor(r.confidence);
-  const tp = round2(DERIV_STAKE_AMOUNT * tpPct / 100), sl = round2(DERIV_STAKE_AMOUNT * SL_PCT / 100);
-
-  // Bu simvolda TP/SL-li müqavilə varmı? (dəqiq "yoxdur" cavabı gəlsə düymə göstərilmir)
-  let canTrade = !!DERIV_API_TOKEN;
-  let note = '<i>Bu avtomatik texniki siqnaldır, maliyyə məsləhəti deyil. Auto-trade hələ aktiv deyil.</i>';
-  if (DERIV_API_TOKEN) {
-    note = '<i>Aşağıdakı düymə ilə bir kliklə əməliyyat açılır; TP/SL Deriv tərəfindən avtomatik icra olunur.</i>';
-    if (tradingAuthorized) {
-      try {
-        const range = await getMultiplierRange(r.symbol);
-        if (range === null) { canTrade = false; note = '⚠️ <i>Bu simvolda TP/SL-li (multiplier) müqavilə yoxdur — yalnız siqnal.</i>'; }
-      } catch (e) { /* müvəqqəti xəta: düymə yenə də göstərilir, klikdə yoxlanılacaq */ }
-    }
-  }
+  const autoTradeNote = (DERIV_API_TOKEN && AUTO_TRADE)
+    ? `<i>🤖 Avto-alış aktivdir: ${DERIV_STAKE_AMOUNT} ${tradingCurrency || 'USD'} · SL ${STOP_LOSS_PCT}% · TP ${TAKE_PROFIT_PCT}%</i>`
+    : DERIV_API_TOKEN
+    ? '<i>Aşağıdakı düymə ilə bir kliklə Deriv-də əməliyyat açıla bilər.</i>'
+    : '<i>Bu avtomatik texniki siqnaldır, maliyyə məsləhəti deyil. Auto-trade hələ aktiv deyil.</i>';
   const lines = [
-    `${GROUP_EMOJI[r.group] || ''} ${emoji} <b>${r.symbol}</b> — <b>${dirText}</b>${confluenceText}`,
-    `Güc: ${r.strength}`,
+    `${emoji} <b>${r.symbol}</b> — <b>${dirText}</b>${confluenceText}`,
+    `Tövsiyə olunan expiry: <b>${expText}</b> (${r.strength})`,
     `Etibar: <b>${r.confidence}%</b> ${confBar(r.confidence)}`,
     `Qiymət: <code>${fmt(r.price)}</code>`,
-    `Plan: stake ${DERIV_STAKE_AMOUNT}$ · TP +${tp}$ (${tpPct.toFixed(0)}%) · SL −${sl}$ (${SL_PCT}%)`,
     `Səbəblər: ${r.reasons.join(', ')}`,
-    note,
+    autoTradeNote,
   ];
   const btnText = r.dir === 'CALL' ? '🟢 AL (CALL)' : '🔴 SAT (PUT)';
-  const reply_markup = canTrade
-    ? { inline_keyboard: [[{ text: btnText, callback_data: `B|${r.symbol}|${r.dir}|${Math.round(r.confidence)}` }]] }
+  const reply_markup = (DERIV_API_TOKEN && !AUTO_TRADE)
+    ? { inline_keyboard: [[{ text: btnText, callback_data: `B|${r.symbol}|${r.dir}|${expiryMinutes(r.expiry)}` }]] }
     : undefined;
   await telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: lines.join('\n'), parse_mode: 'HTML', reply_markup });
 }
@@ -888,14 +795,14 @@ async function handleCallbackQuery(cq) {
   const baseText = cq.message.text || '';
   try {
     if (data.startsWith('B|')) {
-      const [, symbol, dir, confStr] = data.split('|');
-      const res = await buyMultiplier(symbol, dir, Number(confStr) || MIN_CONFIDENCE);
-      const buy = res.buy;
+      const [, symbol, dir, durStr] = data.split('|');
+      const durMin = Number(durStr) || 15;
+      const buy = await buyContract(symbol, dir, durMin);
       const acc = tradingIsVirtual ? 'DEMO' : 'REAL';
       const closeBtn = { inline_keyboard: [[{ text: '🔴 Bağla (indi sat)', callback_data: `S|${buy.contract_id}` }]] };
       await telegram('editMessageText', {
         chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-        text: `${baseText}\n\n✅ <b>ALINDI (${acc})</b> — stake: ${DERIV_STAKE_AMOUNT} ${tradingCurrency || ''} · ×${res.mult}\nTP +${res.tp} (${res.tpPct.toFixed(0)}%) · SL −${res.sl} (${SL_PCT}%) · #${buy.contract_id}`,
+        text: `${baseText}\n\n✅ <b>ALINDI (${acc})</b> — stake: ${DERIV_STAKE_AMOUNT} ${tradingCurrency || ''} · #${buy.contract_id}`,
         reply_markup: closeBtn,
       });
       await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: '✅ Alındı' });
@@ -1022,7 +929,7 @@ async function reportTradingStatusOnBoot() {
     const acc = tradingIsVirtual ? 'DEMO' : 'REAL ⚠️';
     await telegram('sendMessage', {
       chat_id: TELEGRAM_CHAT_ID,
-      text: `✅ Trading bağlantısı hazırdır — hesab: ${acc} (${tradingAccountId}), valyuta: ${tradingCurrency}, stake: ${DERIV_STAKE_AMOUNT}, TP ${TP_MIN_PCT}–${TP_MAX_PCT}%, SL ${SL_PCT}%, gündəlik zərər limiti: ${DAILY_LOSS_LIMIT}. AL/Bağla düymələri aktivdir.`,
+      text: `✅ Trading bağlantısı hazırdır — hesab: ${acc} (${tradingAccountId}), valyuta: ${tradingCurrency}, stake: ${DERIV_STAKE_AMOUNT}. ${AUTO_TRADE ? `Avto-alış AKTİV (SL ${STOP_LOSS_PCT}%, TP ${TAKE_PROFIT_PCT}%).` : 'AL/Bağla düymələri aktivdir.'}`,
     });
   } else {
     await telegram('sendMessage', {
