@@ -675,7 +675,7 @@ const mulCache = new Map();
 async function getMultiplierRange(symbol) {
   const c = mulCache.get(symbol);
   if (c && Date.now() - c.ts < 6 * 3600 * 1000) return c.range;
-  const msg = await tradingRequest({ contracts_for: symbol, currency: tradingCurrency || 'USD' });
+  const msg = await tradingRequest({ contracts_for: symbol });
   const avail = msg?.contracts_for?.available;
   if (!Array.isArray(avail) || !avail.length) return undefined;
   const mult = avail.find((a) => /^MULT(UP|DOWN)$/i.test(a.contract_type || '') || String(a.contract_category || '').toLowerCase() === 'multiplier');
