@@ -11,7 +11,8 @@ const PORT = Number(process.env.PORT || 8788);
 // === Deriv bağlantısı ===
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
 const DERIV_API_TOKEN = (process.env.DERIV_API_TOKEN || '').trim();
-const DERIV_STAKE_AMOUNT = Number(process.env.DERIV_STAKE_AMOUNT || 0.35);
+// Deriv minimum stake = 0.50; default 10$ (Railway Variables-da DERIV_STAKE_AMOUNT varsa o əvəz edir)
+const DERIV_STAKE_AMOUNT = Math.max(0.5, Number(process.env.DERIV_STAKE_AMOUNT || 10));
 // Əvvəl yeni public endpoint, alınmasa köhnə endpoint (avtomatik növbələnir)
 const DERIV_WS_URLS = process.env.DERIV_WS_URL
   ? [process.env.DERIV_WS_URL]
@@ -33,7 +34,7 @@ const SIGNAL_COOLDOWN_MIN = Number(process.env.SIGNAL_COOLDOWN_MIN || 3);
 const MAX_DAILY_TRADES = Number(process.env.MAX_DAILY_TRADES || 40);
 // Avtomatik alış və hesab səviyyəli risk limitləri (başlanğıc balans üzərindən faizlə)
 let AUTO_TRADE = (process.env.AUTO_TRADE || 'true') !== 'false'; // /api/autotrade ilə dəyişdirilə bilir
-const START_BALANCE = Number(process.env.START_BALANCE || 20);
+const START_BALANCE = Number(process.env.START_BALANCE || 500);
 const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 30);
 const TP_MIN_PCT = Number(process.env.TAKE_PROFIT_MIN_PCT || 30);
 const TP_MAX_PCT = Number(process.env.TAKE_PROFIT_MAX_PCT || 50);
@@ -698,16 +699,24 @@ let tradeDay = null, tradesToday = 0;
 async function buyContract(symbol, dir, durationMin) {
   rolloverDay();
   if (tradesToday >= MAX_DAILY_TRADES) throw new Error(`Gündəlik limit dolub (${MAX_DAILY_TRADES} əməliyyat)`);
-  const proposalMsg = await tradingRequest({
-    proposal: 1,
-    amount: DERIV_STAKE_AMOUNT,
-    basis: 'stake',
-    contract_type: dir,
-    currency: tradingCurrency || 'USD',
-    underlying_symbol: symbol,
-    duration: durationMin,
-    duration_unit: 'm',
-  });
+  let proposalMsg;
+  try {
+    proposalMsg = await tradingRequest({
+      proposal: 1,
+      amount: DERIV_STAKE_AMOUNT,
+      basis: 'stake',
+      contract_type: dir,
+      currency: tradingCurrency || 'USD',
+      underlying_symbol: symbol,
+      duration: durationMin,
+      duration_unit: 'm',
+    });
+  } catch (e) {
+    if (/not offered for this duration/i.test(e.message)) {
+      throw new Error(`${symbol} üçün ${durationMin} dəq müddət hazırda təklif olunmur`);
+    }
+    throw e;
+  }
   const p = proposalMsg.proposal;
   if (!p?.id) throw new Error('Proposal alınmadı');
   const buyMsg = await tradingRequest({ buy: p.id, price: p.ask_price });
@@ -862,6 +871,8 @@ async function autoTrade(r) {
   try {
     buy = await placeTrade(r.symbol, r.dir, dur, { source: 'auto' });
   } catch (e) {
+    // Müddət təklif olunmursa, cooldown-u işə sal ki, eyni simvol üçün təkrar-təkrar cəhd olmasın
+    if (/müddət hazırda təklif olunmur/.test(e.message)) state.lastSignalAt.set(r.symbol, { dir: r.dir, ts: Date.now(), confidence: r.confidence });
     if (!e.gate) notifyTradeError(r.symbol, e.message); // limit/pauza/bağlı bazar kimi gözlənilən hallar səssiz keçilir
     return;
   }
