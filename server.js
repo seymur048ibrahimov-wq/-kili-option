@@ -11,12 +11,26 @@ const PORT = Number(process.env.PORT || 8788);
 // === Deriv bağlantısı ===
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
 const DERIV_API_TOKEN = (process.env.DERIV_API_TOKEN || '').trim();
-const DERIV_STAKE_AMOUNT = Number(process.env.DERIV_STAKE_AMOUNT || 1);
-// Telegram düyməsi basılanda mesajda göstərilən "Giriş" qiyməti ilə faktiki alış anındakı bazar
-// qiyməti arasındakı fərq (sürüşmə/slippage) faizlə burdan böyükdürsə, alış BLOKLANIR və istifadəçiyə
-// xəbərdarlıq göstərilir. Default 0 = deaktiv (yalnız fərqi göstərir, bloklamır). Aktiv etmək üçün
-// məs. 0.3 (yəni 0.3%) kimi bir dəyər qoy.
-const MAX_SLIPPAGE_PCT = Number(process.env.MAX_SLIPPAGE_PCT || 0);
+const DERIV_STAKE_AMOUNT = Number(process.env.DERIV_STAKE_AMOUNT || 10);
+
+// === Risk idarəetməsi (Multiplier müqavilələri: TP/SL birbaşa Deriv serverində işləyir) ===
+const TP_MIN_PCT = Number(process.env.TP_MIN_PCT || 20);      // stake-in %-i ilə minimum qazanc hədəfi
+const TP_MAX_PCT = Number(process.env.TP_MAX_PCT || 40);      // stake-in %-i ilə maksimum qazanc hədəfi
+const SL_PCT = Number(process.env.SL_PCT || 35);              // stake-in %-i ilə avtomatik stop-loss
+const TP_CONF_HI = Number(process.env.TP_CONF_HI || 70);      // bu etibar və yuxarıda TP = TP_MAX_PCT
+const TARGET_ATR_PNL = Number(process.env.TARGET_ATR_PNL || 0.20); // 1 ATR(15m) hərəkəti ≈ stake-in 20%-i olsun deyə multiplier seçilir
+const MULT_DEFAULT = Number(process.env.MULT_DEFAULT || 100); // multiplier siyahısı oxunmasa istifadə olunur
+const MAX_OPEN_TRADES = Number(process.env.MAX_OPEN_TRADES || 5);
+const DAILY_LOSS_LIMIT = Number(process.env.DAILY_LOSS_LIMIT || DERIV_STAKE_AMOUNT * 5); // gündəlik zərər limiti ($)
+const MIN_CONFIDENCE_OTHER = Number(process.env.MIN_CONFIDENCE_OTHER || 30); // forex/kripto/əmtəə/step üçün daha sərt hədd
+const MAX_SYMBOLS = Number(process.env.MAX_SYMBOLS || 80);
+const SUB_GAP_MS = Number(process.env.SUB_GAP_MS || 250);     // Deriv rate-limit-ə düşməmək üçün abunə sorğuları arası fasilə
+const flag = (name, def = '1') => String(process.env[name] ?? def) !== '0';
+const INCLUDE_FOREX = flag('INCLUDE_FOREX');
+const INCLUDE_CRYPTO = flag('INCLUDE_CRYPTO');
+const INCLUDE_COMMODITIES = flag('INCLUDE_COMMODITIES');
+const INCLUDE_SYNTH_200_500 = flag('INCLUDE_SYNTH_200_500'); // adında 200/300/400/500 olan sintetik indekslər (Step, Boom/Crash, Range Break...)
+const EXTRA_SYMBOLS = (process.env.EXTRA_SYMBOLS || '').split(',').map(x => x.trim()).filter(Boolean);
 // Əvvəl yeni public endpoint, alınmasa köhnə endpoint (avtomatik növbələnir)
 const DERIV_WS_URLS = process.env.DERIV_WS_URL
   ? [process.env.DERIV_WS_URL]
@@ -27,29 +41,16 @@ const DERIV_WS_URLS = process.env.DERIV_WS_URL
 let urlIdx = 0;
 
 // === Siqnal parametrləri ===
-// QEYD: confidence formulu indi 16 fərdi indikator əvəzinə 4 indikator "ailəsinin" (trend/
-// momentum/volatilite/S-R) çoxluq səsinə əsaslanır (aşağıda analyze() funksiyasına bax), ona görə
-// miqyas dəyişib: LONG/SHORT yaranması üçün artıq minimum 3/4 ailə eyni istiqamətdə olmalıdır
-// (baza confidence >=75%), sonra ADX-ə görə davamlı şəkildə aşağı çəkilir. MIN_CONFIDENCE bunun
-// üzərinə əlavə süzgəcdir.
-const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 50);
+// QEYD: əvvəlki dəyər (15) demək olar heç nəyi filtrləmirdi — score>=4 həddi ilə siqnal
+// yarandığı andaca confidence artıq ~27%-dən başlayır, ona görə 15% praktikada "filtrsiz" idi
+// və çoxlu zəif/yalan siqnal göndərirdi. backtest.js-in öz bucket analizi göstərir ki, real
+// statistik üstünlük yalnız ~65%+ etibar diapazonunda görünür — canlı botu da elə kalibrləyirik.
+const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || 20);
 const SIGNAL_COOLDOWN_MIN = Number(process.env.SIGNAL_COOLDOWN_MIN || 10);
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
 const STATE_FILE = process.env.STATE_FILE || '/tmp/deriv13-state.json';
-
-// === Kalibrasiya / EV süzgəci ===
-// Deriv-in Rise/Fall opsionlarında adətən uduşda stake-in ~85-95%-i qazanılır, uduzanda isə
-// 100% itirilir. Yəni "doğru istiqamət tapmaq" kifayət deyil — faktiki qazanc üçün win-rate
-// bu asimmetrik ödənişi üstələməlidir (breakeven ehtimalı). Botu isə öz keçmiş siqnallarının
-// faktiki nəticəsinə (aşağı bax: outcome-tracking) görə özü-özünü kalibrləyir və bu həddən aşağı
-// bucket-lərdə siqnal göndərməyi avtomatik dayandırır.
-const PAYOUT_PCT = Number(process.env.PAYOUT_PCT || 90); // orta Deriv Rise/Fall ödənişi (stake üstünə mənfəət faizi)
-const BREAKEVEN_PROB = 100 / (1 + PAYOUT_PCT / 100); // faiz (0-100) — bu win-rate-dən aşağı olsa, uzunmüddətli EV mənfidir
-const CONF_BUCKET_SIZE = 10; // confidence 10-luq bucket-lərə bölünür: 50-59, 60-69, ...
-const MIN_SAMPLES_FOR_CALIBRATION = Number(process.env.MIN_SAMPLES_FOR_CALIBRATION || 20); // bucket-də bu qədər nəticə toplanana qədər kalibrasiya tətbiq olunmur, yalnız MIN_CONFIDENCE işləyir
-function confBucket(c) { return Math.floor(c / CONF_BUCKET_SIZE) * CONF_BUCKET_SIZE; }
 
 const DEFAULT_SYMBOLS = ['R_10','R_25','R_50','R_75','R_100'];
 const rawSyms = (process.env.DERIV_SYMBOLS || '').trim();
@@ -58,9 +59,8 @@ const symbols = rawSyms ? rawSyms.split(',').map(s => s.trim()).filter(Boolean) 
 const TIMEFRAMES = ['15m'];
 const TREND_TF = '1h';
 const CONFIRM_TF = '5m';
-const MACRO_TFS = ['4h', '1d']; // yalnız kontekst (makro trend + aralıq) üçün — LONG/SHORT qərarına təsir etmir
-const GRANULARITY = { '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
-const ALL_TFS = [CONFIRM_TF, ...TIMEFRAMES, TREND_TF, ...MACRO_TFS];
+const GRANULARITY = { '5m': 300, '15m': 900, '1h': 3600 };
+const ALL_TFS = [CONFIRM_TF, ...TIMEFRAMES, TREND_TF];
 
 function key(symbol, tf) { return `${symbol}|${tf}`; }
 
@@ -76,140 +76,33 @@ const state = {
   clients: new Set(),
   activeSymbols: symbols.slice(),
   availableSymbols: [],
-  // === Outcome-tracking (özünü-kalibrləmə) ===
-  outcomeStats: new Map(), // "symbol|confBucket" -> { wins, losses }
-  pendingOutcomes: [],     // göndərilmiş siqnalların hələ nəticəsi bilinməyənləri: { symbol, dir, tf, entryPrice, bucket, checkAt, reasons }
-  indicatorStats: new Map(), // reason (indikator etiketi, məs. "RSI oversold") -> { wins, losses } — hansı indikatorun həqiqətən işlədiyini izləmək üçün
-  // === Risk / kill-switch ===
-  dayStartEquity: null, dayStartAt: 0, tradingHalted: false, haltReason: null,
+  symMeta: new Map(),   // simvol -> { market, name, open, suspended }
+  symGroup: new Map(),  // simvol -> base|forex|crypto|commodity|synthetic|extra
 };
+const openTrades = new Map();   // contract_id -> { symbol, dir, stake, tp, sl, mult, openedAt }
+const pendingBuys = new Set();  // eyni simvola ikiqat klikin qarşısını alır
+let dailyPnl = { day: '', pnl: 0 };
+function resetDailyIfNeeded() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (dailyPnl.day !== day) dailyPnl = { day, pnl: 0 };
+}
+const round2 = (x) => Math.round(x * 100) / 100;
 
 function saveState() {
   const dump = {
     signals: state.signals.slice(-200),
     lastSignalAt: [...state.lastSignalAt.entries()],
-    outcomeStats: [...state.outcomeStats.entries()],
-    pendingOutcomes: state.pendingOutcomes,
-    indicatorStats: [...state.indicatorStats.entries()],
-    dayStartEquity: state.dayStartEquity,
-    dayStartAt: state.dayStartAt,
-    tradingHalted: state.tradingHalted,
-    haltReason: state.haltReason,
   };
-  if (pgPool) {
-    pgPool.query(
-      `INSERT INTO deriv13_state(id,data,updated_at) VALUES(1,$1,now()) ON CONFLICT(id) DO UPDATE SET data=$1, updated_at=now()`,
-      [dump]
-    ).catch((e) => console.error('[state] Postgres yazma xətası:', e.message));
-    return;
-  }
   fs.writeFile(STATE_FILE, JSON.stringify(dump), (e) => { if (e) console.error('[state] yazma xətası:', e.message); });
 }
-async function loadState() {
-  let d = null;
-  if (pgPool) {
-    try { const res = await pgPool.query('SELECT data FROM deriv13_state WHERE id=1'); d = res.rows?.[0]?.data || null; }
-    catch (e) { console.error('[state] Postgres oxuma xətası:', e.message); }
-  }
-  if (!d) {
-    try { if (fs.existsSync(STATE_FILE)) d = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (e) {}
-  }
-  if (!d) return;
-  if (Array.isArray(d.signals)) state.signals = d.signals;
-  if (Array.isArray(d.lastSignalAt)) state.lastSignalAt = new Map(d.lastSignalAt);
-  if (Array.isArray(d.outcomeStats)) state.outcomeStats = new Map(d.outcomeStats);
-  if (Array.isArray(d.pendingOutcomes)) state.pendingOutcomes = d.pendingOutcomes;
-  if (Array.isArray(d.indicatorStats)) state.indicatorStats = new Map(d.indicatorStats);
-  if (d.dayStartEquity != null) state.dayStartEquity = d.dayStartEquity;
-  if (d.dayStartAt) state.dayStartAt = d.dayStartAt;
-  if (d.tradingHalted) { state.tradingHalted = true; state.haltReason = d.haltReason; }
-}
-// === İxtiyari Postgres (DATABASE_URL) — Railway-də disk müvəqqətidir (/tmp hər redeploy-da silinir),
-// ona görə kalibrasiya statistikası və kill-switch vəziyyəti Postgres olmadan hər dəyişiklikdən sonra itir.
-// DATABASE_URL təyin olunmayıbsa, avtomatik olaraq fayl-based saxlamaya (STATE_FILE) keçilir (işləyər,
-// amma redeploy-da sıfırlanar). Railway-də: New → Database → Postgres, sonra dəyişəni servisə bağla.
-let pgPool = null;
-async function initDb() {
-  if (!process.env.DATABASE_URL) { console.log('[state] DATABASE_URL yoxdur — fayl-based saxlama (/tmp) istifadə olunur, redeploy-da sıfırlanacaq'); return; }
+function loadState() {
   try {
-    const { Pool } = await import('pg');
-    pgPool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-    await pgPool.query(`CREATE TABLE IF NOT EXISTS deriv13_state (id INT PRIMARY KEY DEFAULT 1, data JSONB, updated_at TIMESTAMPTZ DEFAULT now())`);
-    console.log('[state] Postgres bağlantısı quruldu — vəziyyət daimi saxlanılacaq');
-  } catch (e) {
-    console.warn('[state] Postgres qoşula bilmədi ("pg" paketi quraşdırılıbmı?), fayl-based saxlamaya keçilir:', e.message);
-    pgPool = null;
-  }
+    if (!fs.existsSync(STATE_FILE)) return;
+    const d = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (Array.isArray(d.signals)) state.signals = d.signals;
+    if (Array.isArray(d.lastSignalAt)) state.lastSignalAt = new Map(d.lastSignalAt);
+  } catch (e) {}
 }
-
-// Bir bucket-ə (simvol + confidence aralığı) WIN/LOSS nəticəsi əlavə edir — hər simvol AYRI izlənilir,
-// çünki R_10 ilə R_100 çox fərqli davranır, ortaq statistika yanlış rəhbərlik edə bilər.
-function outcomeKey(symbol, bucket) { return `${symbol}|${bucket}`; }
-function recordOutcome(symbol, bucket, win) {
-  const k = outcomeKey(symbol, bucket);
-  const s = state.outcomeStats.get(k) || { wins: 0, losses: 0 };
-  if (win) s.wins++; else s.losses++;
-  state.outcomeStats.set(k, s);
-}
-// Wilson score aşağı sərhədi: kiçik nümunə sayında sadə "wins/total" nisbəti aldadıcı ola bilər —
-// məs. 20 nəticədə 60% görünsə də, real ehtimal statistik olaraq 40-80% arasında ola bilər. Wilson
-// bunun KONSERVATİV (aşağı sərhəd) qiymətini verir — "şansla" gələn qısa uğurlu seriyanı əsl edge
-// kimi qəbul etməməyə kömək edir. z=1.645 ≈ 95% birtərəfli etibar səviyyəsi (ehtiyatlı seçim).
-function wilsonLowerBound(wins, total, z = 1.645) {
-  if (total === 0) return null;
-  const phat = wins / total;
-  const denom = 1 + (z * z) / total;
-  const center = phat + (z * z) / (2 * total);
-  const margin = z * Math.sqrt((phat * (1 - phat) + (z * z) / (4 * total)) / total);
-  return (center - margin) / denom;
-}
-// Bu simvol + confidence bucket-i üçün kifayət qədər tarixi nəticə varsa, KONSERVATİV win-rate qaytarır
-function calibratedWinProb(symbol, confidence) {
-  const s = state.outcomeStats.get(outcomeKey(symbol, confBucket(confidence)));
-  if (!s) return null;
-  const total = s.wins + s.losses;
-  if (total < MIN_SAMPLES_FOR_CALIBRATION) return null;
-  return wilsonLowerBound(s.wins, total) * 100;
-}
-// Siqnal göndəriləndə "virtual" nəticə izləməyə qoşulur: expiry bitəndə qiymət hansı tərəfə
-// getdiyinə görə WIN/LOSS qeydə alınır — real pul qoymasa belə statistika toplanır
-function scheduleOutcomeCheck(entry) {
-  const minutes = expiryMinutes(entry.expiry);
-  state.pendingOutcomes.push({
-    symbol: entry.symbol, dir: entry.dir, tf: entry.expiry,
-    entryPrice: entry.price, bucket: confBucket(entry.confidence),
-    checkAt: Date.now() + minutes * 60 * 1000,
-    reasons: entry.reasons, // hansı indikatorlar bu siqnalı yaratdı — nəticə bəlliyəndə performans izləmək üçün
-  });
-  saveState();
-}
-function recordIndicatorOutcome(reasons, win) {
-  for (const reason of reasons || []) {
-    const s = state.indicatorStats.get(reason) || { wins: 0, losses: 0 };
-    if (win) s.wins++; else s.losses++;
-    state.indicatorStats.set(reason, s);
-  }
-}
-function checkPendingOutcomes() {
-  const now = Date.now();
-  const still = [];
-  for (const p of state.pendingOutcomes) {
-    if (now < p.checkAt) { still.push(p); continue; }
-    const candles = getCandles(p.symbol, p.tf);
-    const last = candles.at(-1);
-    // Bu simvol üçün hələ yeni şam gəlməyibsə, 5 dəqiqə əlavə gözlə (data gecikməsi)
-    if (!last || last.t < p.checkAt) {
-      if (now - p.checkAt < 5 * 60 * 1000) { still.push(p); continue; }
-      continue; // 5 dəqiqədən çoxdursa, data heç gəlməyib — bu nümunəni atırıq
-    }
-    const win = p.dir === 'CALL' ? last.c > p.entryPrice : last.c < p.entryPrice;
-    recordOutcome(p.symbol, p.bucket, win);
-    recordIndicatorOutcome(p.reasons, win);
-  }
-  state.pendingOutcomes = still;
-  saveState();
-}
-setInterval(checkPendingOutcomes, 30000);
 
 function ema(a,p){ if(a.length<p) return null; const k=2/(p+1); let e=a.slice(0,p).reduce((x,y)=>x+y,0)/p; for(let i=p;i<a.length;i++) e=a[i]*k+e*(1-k); return e; }
 function sma(a,p){ if(a.length<p) return null; return a.slice(-p).reduce((x,y)=>x+y,0)/p; }
@@ -222,11 +115,6 @@ function cci(c,p=20){if(c.length<p)return null;const t=c.slice(-p).map(x=>(x.h+x
 function mfi(c,p=14){if(c.length<p+1)return null;let pos=0,neg=0;for(let i=c.length-p;i<c.length;i++){const a=(c[i-1].h+c[i-1].l+c[i-1].c)/3,b=(c[i].h+c[i].l+c[i].c)/3,m=b*c[i].v;if(b>a)pos+=m;else if(b<a)neg+=m;}if(neg===0)return 100;const r=pos/neg;return 100-100/(1+r);}
 function obvTrend(c,n=10){if(c.length<n+1)return 0;let s=0;for(let i=c.length-n;i<c.length;i++){if(c[i].c>c[i-1].c)s+=c[i].v;else if(c[i].c<c[i-1].c)s-=c[i].v;}return s;}
 function structure(c){if(c.length<20)return 0;const n=10,a=c.slice(-n),b=c.slice(-2*n,-n),ah=Math.max(...a.map(x=>x.h)),al=Math.min(...a.map(x=>x.l)),bh=Math.max(...b.map(x=>x.h)),bl=Math.min(...b.map(x=>x.l));return ah>bh&&al>bl?1:ah<bh&&al<bl?-1:0;}
-// === Əlavə (köməkçi) indikatorlar — yalnız OHLC əsasında, real "volume" tələb etmir ===
-function aroon(c,p=14){ if(c.length<p+1)return null; const s=c.slice(-(p+1)); let hiIdx=0,loIdx=0; for(let i=1;i<s.length;i++){ if(s[i].h>=s[hiIdx].h) hiIdx=i; if(s[i].l<=s[loIdx].l) loIdx=i; } return { up: 100*hiIdx/p, down: 100*loIdx/p }; }
-function roc(a,p=12){ if(a.length<p+1)return null; const prev=a[a.length-1-p]; return prev===0?null:((a.at(-1)-prev)/prev)*100; }
-function vortex(c,p=14){ if(c.length<p+1)return null; let vp=0,vm=0,tr=0; for(let i=c.length-p;i<c.length;i++){ vp+=Math.abs(c[i].h-c[i-1].l); vm+=Math.abs(c[i].l-c[i-1].h); tr+=Math.max(c[i].h-c[i].l,Math.abs(c[i].h-c[i-1].c),Math.abs(c[i].l-c[i-1].c)); } return tr===0?null:{ viPlus: vp/tr, viMinus: vm/tr }; }
-function donchian(c,p=20){ if(c.length<p)return null; const s=c.slice(-p); return { upper: Math.max(...s.map(x=>x.h)), lower: Math.min(...s.map(x=>x.l)) }; }
 function adx(c,p=14){
   if(c.length<p*2+1)return null;
   const plusDM=[],minusDM=[],tr=[];
@@ -326,68 +214,36 @@ function superTrend(c,p=10,mult=3){
 
 function analyze(c){
   if(c.length<60)return null;
-  const close=c.map(x=>x.c),price=close.at(-1),e9=ema(close,9),e21=ema(close,21),e50=ema(close,50),e200=ema(close,200),rv=rsi(close),mv=macd(close),bb=bollinger(close),st=stochastic(c),av=atr(c),cv=cci(c),str=structure(c),ax=adx(c),ich=ichimoku(c),psar=parabolicSar(c),piv=pivotPoints(c),fib=fibLevels(c),wr=williamsR(c),kelt=keltnerChannel(c,close),ha=heikinAshiTrend(c),stnd=superTrend(c),aro=aroon(c),rc=roc(close),vtx=vortex(c),donch=donchian(c);
+  const close=c.map(x=>x.c),price=close.at(-1),e9=ema(close,9),e21=ema(close,21),e50=ema(close,50),e200=ema(close,200),rv=rsi(close),mv=macd(close),bb=bollinger(close),st=stochastic(c),av=atr(c),cv=cci(c),str=structure(c),ax=adx(c),ich=ichimoku(c),psar=parabolicSar(c),piv=pivotPoints(c),fib=fibLevels(c),wr=williamsR(c),kelt=keltnerChannel(c,close),ha=heikinAshiTrend(c),stnd=superTrend(c);
   // QEYD: OBV/MFI/VWAP HESABLANMIR — Deriv sintetik indekslərində real "volume" yoxdur
   // (aşağıda hər şam üçün v:1 sabit qoyulur), ona görə bu indikatorlar burda mənasız/aldadıcı
   // olardı və score-a əlavə "sanki-güvən" verərdi. OKX kripto versiyasında (real hədcm datası ilə)
   // bunlar saxlanılıb, çünki orda faktiki məna daşıyır.
-
-  // === Qruplaşdırılmış səsvermə ===
-  // Əvvəlki versiyada 16 indikator birbaşa 1x1 cəmlənirdi. Problemi budur ki, bunların çoxu
-  // eyni məlumatı (məs. "overbought/oversold") fərqli formullarla təkrarlayır — RSI, Stochastic,
-  // CCI və Williams %R demək olar həmişə birlikdə hərəkət edir. Onları müstəqil "səs" kimi saymaq
-  // confidence-i süni şəkildə şişirdirdi. İndi indikatorlar 4 "ailəyə" bölünür, hər ailə daxilində
-  // çoxluq qaydası ilə YALNIZ ±1 səs verir, yekun score bu 4 ailənin cəmidir (-4..+4). Bu həm
-  // real müstəqil dəlil sayını düzgün əks etdirir, həm də LONG/SHORT üçün 4 ailədən ən azı 3-nün
-  // (75%) razılaşmasını tələb edərək zəif/qarışıq siqnalları əvvəlcədən süzür.
-
-  let trendVotes=0,reasons=[];
-  if(e9>e21&&e21>e50){trendVotes++;reasons.push('EMA trend +');}else if(e9<e21&&e21<e50){trendVotes--;reasons.push('EMA trend -');}
-  if(e200!=null){if(price>e200){trendVotes++;reasons.push('EMA200 üzərində');}else{trendVotes--;reasons.push('EMA200 altında');}}
-  if(mv>0){trendVotes++;reasons.push('MACD +');}else if(mv<0){trendVotes--;reasons.push('MACD -');}
-  if(str>0){trendVotes++;reasons.push('higher highs/lows');}else if(str<0){trendVotes--;reasons.push('lower highs/lows');}
-  if(ich&&ich.score!==0){if(ich.score>0){trendVotes++;reasons.push('Ichimoku bulud üzərində');}else{trendVotes--;reasons.push('Ichimoku bulud altında');}}
-  if(psar){if(psar.uptrend){trendVotes++;reasons.push('Parabolic SAR yüksəliş');}else{trendVotes--;reasons.push('Parabolic SAR düşüş');}}
-  if(ha!==0){if(ha>0){trendVotes++;reasons.push('Heikin-Ashi yüksəliş');}else{trendVotes--;reasons.push('Heikin-Ashi düşüş');}}
-  if(stnd){if(stnd.uptrend){trendVotes++;reasons.push('SuperTrend yüksəliş');}else{trendVotes--;reasons.push('SuperTrend düşüş');}}
-  if(aro){if(aro.up>70&&aro.down<30){trendVotes++;reasons.push('Aroon yüksəliş');}else if(aro.down>70&&aro.up<30){trendVotes--;reasons.push('Aroon düşüş');}}
-  if(vtx){if(vtx.viPlus>vtx.viMinus){trendVotes++;reasons.push('Vortex +');}else if(vtx.viMinus>vtx.viPlus){trendVotes--;reasons.push('Vortex -');}}
-  const trendCat=trendVotes>0?1:trendVotes<0?-1:0;
-
-  let momVotes=0;
-  if(rv<35){momVotes++;reasons.push('RSI oversold');}else if(rv>65){momVotes--;reasons.push('RSI overbought');}
-  if(st<20){momVotes++;reasons.push('Stoch oversold');}else if(st>80){momVotes--;reasons.push('Stoch overbought');}
-  if(cv<-100){momVotes++;reasons.push('CCI oversold');}else if(cv>100){momVotes--;reasons.push('CCI overbought');}
-  if(wr!=null){if(wr<-80){momVotes++;reasons.push('Williams %R oversold');}else if(wr>-20){momVotes--;reasons.push('Williams %R overbought');}}
-  if(rc!=null){if(rc>0){momVotes++;reasons.push('ROC +');}else if(rc<0){momVotes--;reasons.push('ROC -');}}
-  const momCat=momVotes>0?1:momVotes<0?-1:0;
-
-  let volVotes=0;
-  if(bb){if(price<=bb.lower){volVotes++;reasons.push('BB alt zolaq');}else if(price>=bb.upper){volVotes--;reasons.push('BB üst zolaq');}}
-  if(kelt){if(price<=kelt.lower){volVotes++;reasons.push('Keltner alt zolaq');}else if(price>=kelt.upper){volVotes--;reasons.push('Keltner üst zolaq');}}
-  if(donch){if(price<=donch.lower){volVotes++;reasons.push('Donchian alt sərhəd');}else if(price>=donch.upper){volVotes--;reasons.push('Donchian üst sərhəd');}}
-  const volCat=volVotes>0?1:volVotes<0?-1:0;
-
-  let srVotes=0;
-  if(piv){if(price>piv.pp){srVotes++;reasons.push('Pivot üzərində');}else if(price<piv.pp){srVotes--;reasons.push('Pivot altında');}}
-  if(fib){if(price>fib.r500){srVotes++;reasons.push('Fib 50% üzərində');}else{srVotes--;reasons.push('Fib 50% altında');}}
-  const srCat=srVotes>0?1:srVotes<0?-1:0;
-
-  const score=trendCat+momCat+volCat+srCat; // -4..+4, hər ailədən max ±1
-
-  let confidence=Math.round(Math.abs(score)/4*100);
-  // ADX artıq sərt kəsici (əvvəlki: <15 bağla, >=25 +8 bonus) deyil, davamlı multiplier-dir:
-  // ADX<=10-da confidence-in 55%-i, ADX>=40-da 100%-i qalır — beləcə ADX=14/16 kimi sərhəd
-  // hallarda qəfil keyfiyyət sıçrayışı olmur.
+  let score=0,reasons=[];
+  if(e9>e21&&e21>e50){score+=1;reasons.push('EMA trend +');}else if(e9<e21&&e21<e50){score-=1;reasons.push('EMA trend -');}
+  if(e200!=null){if(price>e200){score+=1;reasons.push('EMA200 üzərində');}else{score-=1;reasons.push('EMA200 altında');}}
+  if(rv<35){score+=1;reasons.push('RSI oversold');}else if(rv>65){score-=1;reasons.push('RSI overbought');}
+  if(mv>0){score+=1;reasons.push('MACD +');}else if(mv<0){score-=1;reasons.push('MACD -');}
+  if(bb){if(price<=bb.lower){score+=1;reasons.push('BB alt zolaq');}else if(price>=bb.upper){score-=1;reasons.push('BB üst zolaq');}}
+  if(st<20){score+=1;reasons.push('Stoch oversold');}else if(st>80){score-=1;reasons.push('Stoch overbought');}
+  if(cv<-100){score+=1;reasons.push('CCI oversold');}else if(cv>100){score-=1;reasons.push('CCI overbought');}
+  if(str>0){score+=1;reasons.push('higher highs/lows');}else if(str<0){score-=1;reasons.push('lower highs/lows');}
+  if(ich&&ich.score!==0){if(ich.score>0){score+=1;reasons.push('Ichimoku bulud üzərində');}else{score-=1;reasons.push('Ichimoku bulud altında');}}
+  if(psar){if(psar.uptrend){score+=1;reasons.push('Parabolic SAR yüksəliş');}else{score-=1;reasons.push('Parabolic SAR düşüş');}}
+  if(piv){if(price>piv.pp){score+=1;reasons.push('Pivot üzərində');}else if(price<piv.pp){score-=1;reasons.push('Pivot altında');}}
+  if(fib){if(price>fib.r500){score+=1;reasons.push('Fib 50% üzərində');}else{score-=1;reasons.push('Fib 50% altında');}}
+  if(wr!=null){if(wr<-80){score+=1;reasons.push('Williams %R oversold');}else if(wr>-20){score-=1;reasons.push('Williams %R overbought');}}
+  if(kelt){if(price<=kelt.lower){score+=1;reasons.push('Keltner alt zolaq');}else if(price>=kelt.upper){score-=1;reasons.push('Keltner üst zolaq');}}
+  if(ha!==0){if(ha>0){score+=1;reasons.push('Heikin-Ashi yüksəliş');}else{score-=1;reasons.push('Heikin-Ashi düşüş');}}
+  if(stnd){if(stnd.uptrend){score+=1;reasons.push('SuperTrend yüksəliş');}else{score-=1;reasons.push('SuperTrend düşüş');}}
+  let confidence=Math.round(Math.min(100,Math.abs(score)/16*100));
   if(ax!=null){
-    const adxFactor=Math.max(0,Math.min(1,(ax-10)/30));
-    confidence=Math.round(confidence*(0.55+0.45*adxFactor));
-    reasons.push(`ADX ${ax.toFixed(0)}`);
+    if(ax>=25){confidence=Math.min(100,confidence+8);reasons.push(`ADX güclü trend (${ax.toFixed(0)})`);}
+    else if(ax<15){confidence=Math.max(0,confidence-12);reasons.push(`ADX zəif/yan bazar (${ax.toFixed(0)})`);}
   }
-  let signal=score>0?'LONG':score<0?'SHORT':'WAIT'; // artıq zəif meyl də (score=±1/±2) göstərilir, yalnız tam neytral (0) WAIT-dır
-  // Çox zəif/trendsiz bazar (ADX<10): bu şəraitdə demək olar bütün trend indikatorları aldadıcıdır,
-  // ona görə MIN_CONFIDENCE-dan asılı olmayaraq tam bloklanır
-  if (ax!=null && ax<10) { signal='WAIT'; reasons.push('ADX<10 — trendsiz bazar, bloklandı'); }
+  // ADX<15 = yan/trendsiz bazar → bu şəraitdə əksər trend indikatorları aldadıcı siqnal verir,
+  // ona görə MIN_CONFIDENCE-dan asılı olmayaraq siqnalı tam bloklayırıq (yalan siqnalların əsas mənbəyi budur)
+  let signal=(ax!=null&&ax<15)?'WAIT':(score>=5?'LONG':score<=-5?'SHORT':'WAIT');
   // Spike filtri: sintetik indekslərdə (xüsusən Boom/Crash/Jump) tək şamda ATR-dən 3+ dəfə
   // böyük hərəkət baş verə bilər — bu zaman indikatorlar etibarsızdır, siqnal bloklanır
   const lastBar=c.at(-1), barRange=lastBar.h-lastBar.l;
@@ -402,23 +258,20 @@ function fullAnalysis(symbol){
   const m5 = a[CONFIRM_TF], m15 = a['15m'], h1 = a[TREND_TF];
   if (!m15) return null;
 
-  let final = m15.signal, expiry = final !== 'WAIT' ? '15m' : null;
-  // Gücə görə 3 pilləli etiket — artıq h1 ilə TAM üst-üstə düşmə tələb OLUNMUR (əvvəlki versiyada
-  // final yalnız m15===h1 olanda təyin olunurdu, bu da praktikada saatlarla heç bir mesaj gəlməməsinə
-  // səbəb olurdu). İndi hər meyl göstərilir, gücü isə aydın etiketlənir ki, istifadəçi özü seçə bilsin.
+  let final = 'WAIT', expiry = null, strength = 'zəif';
   let confluence = 0;
   if (m15.signal !== 'WAIT') confluence++;
-  if (h1 && final !== 'WAIT' && h1.signal === final) confluence++;
-  if (m5 && final !== 'WAIT' && m5.signal === final) confluence++;
-  const absScore = Math.abs(m15.score);
-  let strength;
-  if (absScore >= 3 && confluence >= 2) strength = '🟢 güclü';
-  else if (absScore >= 2 || confluence >= 1) strength = '🟡 orta';
-  else strength = '🔴 zəif';
+  if (h1 && h1.signal === m15.signal) confluence++;
+  if (m5 && m5.signal === m15.signal) confluence++;
+
+  if (h1 && m15.signal !== 'WAIT' && m15.signal === h1.signal) {
+    final = m15.signal; expiry = '15m';
+    strength = (m5 && m5.signal === final) ? 'çox güclü (5m+15m+1h uyğun)' : 'güclü (15m+1h trend uyğun)';
+  }
 
   let confidence = m15.confidence;
   if (final !== 'WAIT') {
-    const parts = [m15.confidence, (h1 && h1.signal === final) ? h1.confidence : null, (m5 && m5.signal === final) ? m5.confidence : null].filter(x => x != null);
+    const parts = [m15.confidence, h1?.confidence, (m5 && m5.signal === final) ? m5.confidence : null].filter(x => x != null);
     confidence = Math.round(parts.reduce((s, x) => s + x, 0) / parts.length);
     if (h1 && h1.signal === final) confidence = Math.min(100, confidence + 6);
     if (m5 && m5.signal === final) confidence = Math.min(100, confidence + 4);
@@ -426,19 +279,75 @@ function fullAnalysis(symbol){
 
   const dir = final === 'LONG' ? 'CALL' : final === 'SHORT' ? 'PUT' : 'WAIT';
   const reasons = [...new Set([...(m5?.reasons||[]), ...(m15?.reasons||[]), ...(h1?.reasons||[])])].slice(0, 6);
-
-  // === Makro (1D) trend + 4H/24H qiymət aralığı — yalnız kontekst, LONG/SHORT qərarına təsir etmir ===
-  const d1 = a['1d'];
-  const macroTrend = d1 ? (d1.score > 0 ? 'up' : d1.score < 0 ? 'down' : 'flat') : null;
-  const last4h = getCandles(symbol, '4h').at(-1);
-  const range4h = last4h ? { lo: last4h.l, hi: last4h.h } : null;
-  const last24h1 = getCandles(symbol, '1h').slice(-24);
-  const range24h = last24h1.length ? { lo: Math.min(...last24h1.map(x => x.l)), hi: Math.max(...last24h1.map(x => x.h)) } : null;
-
-  return { symbol, dir, confidence, expiry, strength, confluence, price: m15.price, atr: m15.atr, rsi: m15.rsi, timeframes: a, reasons, macroTrend, range4h, range24h };
+  return { symbol, dir, confidence, expiry, strength, confluence, price: m15.price, atr: m15.atr, rsi: m15.rsi, timeframes: a, reasons };
 }
 
 function getCandles(symbol, tf) { return state.candles.get(key(symbol, tf)) || []; }
+
+// === Simvol qrupları və yoxlamalar ===
+const nameOfSym = (s) => (s && (s.underlying_symbol_name || s.display_name || s.symbol_name)) || '';
+function classifyExtra(s) {
+  const sym = (s && (s.symbol || s.underlying_symbol)) || '';
+  const name = nameOfSym(s);
+  const market = s.market || '';
+  if (INCLUDE_FOREX && market === 'forex' && /^frx/i.test(sym)) return 'forex';           // yalnız real cütlüklər (WLD basket indeksləri xaric)
+  if (INCLUDE_CRYPTO && market === 'cryptocurrency') return 'crypto';
+  if (INCLUDE_COMMODITIES && market === 'commodities' &&
+      (/XAU|XAG|BRO|WTI|OIL/i.test(sym) || /gold|silver|oil|brent|crude/i.test(name))) return 'commodity';
+  if (INCLUDE_SYNTH_200_500 && market === 'synthetic_index' && /\b(200|300|400|500)\b/.test(name)) return 'synthetic';
+  return null;
+}
+function selectExtraSymbols(list) {
+  const out = [];
+  for (const s of list) {
+    const sym = (s.symbol || s.underlying_symbol);
+    const g = sym && classifyExtra(s);
+    if (g) out.push({ symbol: sym, group: g });
+  }
+  return out;
+}
+function updateSymMeta(list) {
+  for (const s of list) {
+    const sym = s.symbol || s.underlying_symbol;
+    if (!sym) continue;
+    state.symMeta.set(sym, {
+      market: s.market || '',
+      name: nameOfSym(s),
+      open: s.exchange_is_open === undefined ? true : !!s.exchange_is_open,
+      suspended: !!s.is_trading_suspended,
+    });
+  }
+}
+const symGroupOf = (sym) => state.symGroup.get(sym) || 'base';
+function marketTradable(symbol) {
+  const m = state.symMeta.get(symbol);
+  return !m || (m.open && !m.suspended);
+}
+// Köhnəlmiş data (bazar bağlıdır / axın kəsilib) üzrə siqnal verilməsin
+function isFresh(symbol) {
+  const now = Date.now();
+  const c15 = getCandles(symbol, '15m').at(-1), h1 = getCandles(symbol, TREND_TF).at(-1);
+  return !!c15 && !!h1 && now - c15.t < 2 * 900 * 1000 && now - h1.t < 2 * 3600 * 1000;
+}
+// Etibar yüksəldikcə TP hədəfi TP_MIN_PCT-dən TP_MAX_PCT-ə qədər artır
+function tpPctFor(confidence) {
+  const lo = MIN_CONFIDENCE, hi = Math.max(TP_CONF_HI, lo + 1);
+  const t = Math.min(1, Math.max(0, ((confidence || 0) - lo) / (hi - lo)));
+  return TP_MIN_PCT + t * (TP_MAX_PCT - TP_MIN_PCT);
+}
+function pickMultiplier(range, desired) {
+  const list = (range || []).map(Number).filter((x) => x > 0);
+  if (!list.length) return null;
+  let best = list[0], bd = Infinity;
+  for (const m of list) { const d = Math.abs(Math.log(m / desired)); if (d < bd) { bd = d; best = m; } }
+  return best;
+}
+// Simvolun cari dəyişkənliyinə görə ideal multiplier: 1 ATR(15m) ≈ stake-in TARGET_ATR_PNL hissəsi
+function desiredMultiplier(symbol) {
+  const a = state.lastAnalysis.get(symbol);
+  if (!a || !a.atr || !a.price) return MULT_DEFAULT;
+  return TARGET_ATR_PNL / (a.atr / a.price);
+}
 
 let derivWs = null;
 let reqSeq = 1;
@@ -464,6 +373,28 @@ function connectDeriv() {
   derivWs = new WebSocket(wsUrl);
   const ws = derivWs;
   let gotCandles = false;
+  let subscribedOnce = false;
+  let pingN = 0;
+  const queue = [];        // abunə sorğu növbəsi — rate-limit-dən qaçmaq üçün tədrici göndərilir
+  let pumping = false;
+  const pump = () => {
+    if (ws !== derivWs || ws.readyState !== WebSocket.OPEN) { pumping = false; return; }
+    const job = queue.shift();
+    if (!job) { pumping = false; return; }
+    const id = reqSeq++;
+    reqMeta.set(id, { symbol: job.symbol, tf: job.tf, tries: job.tries });
+    ws.send(JSON.stringify({
+      ticks_history: job.symbol, style: 'candles', granularity: GRANULARITY[job.tf],
+      count: 300, end: 'latest', subscribe: 1, req_id: id,
+    }));
+    setTimeout(pump, SUB_GAP_MS);
+  };
+  const startPump = (delay = 0) => { if (pumping) return; pumping = true; setTimeout(pump, delay); };
+  const requeue = (m) => {
+    if ((m.tries || 0) >= 5) { console.error(`[deriv] ${m.symbol} ${m.tf} — 5 cəhddən sonra vaz keçildi`); return; }
+    queue.push({ symbol: m.symbol, tf: m.tf, tries: (m.tries || 0) + 1 });
+    startPump(5000);
+  };
   let invalidCount = 0;
   let opened = false;
   let rotated = false;
@@ -484,34 +415,20 @@ function connectDeriv() {
     // Deriv boş qalan bağlantını bağlayır — hər 30 san ping
     clearInterval(pingTimer);
     pingTimer = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ping: 1 }));
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ ping: 1 }));
+      // Hər ~5 dəqiqədə bazarın açıq/bağlı statusunu yenilə
+      if (++pingN % 10 === 0) ws.send(JSON.stringify({ active_symbols: 'brief', req_id: reqSeq++ }));
     }, 30000);
   });
 
   function subscribeCandles(symbolList) {
-    // Deriv qoşulan kimi bütün abunəlikləri (indi 5 simvol × 5 taymfreym = 25) bir anda göndərmək
-    // sürət limitinə toxunub bağlantının qəfil kəsilməsinə səbəb ola bilir — ona görə sorğular
-    // arasına kiçik fasilə qoyulur (partlayış əvəzinə tədricən göndərilir).
-    const jobs = [];
-    for (const symbol of symbolList) for (const tf of ALL_TFS) jobs.push({ symbol, tf });
-    let i = 0;
-    const sendNext = () => {
-      if (ws.readyState !== WebSocket.OPEN || i >= jobs.length) return;
-      const { symbol, tf } = jobs[i++];
-      const id = reqSeq++;
-      reqMeta.set(id, { symbol, tf });
-      ws.send(JSON.stringify({
-        ticks_history: symbol,
-        style: 'candles',
-        granularity: GRANULARITY[tf],
-        count: 300,
-        end: 'latest',
-        subscribe: 1,
-        req_id: id,
-      }));
-      setTimeout(sendNext, 150);
-    };
-    sendNext();
+    for (const symbol of symbolList) {
+      // 5m təsdiq çərçivəsi yalnız əsas simvollar üçün; əlavə bazarlarda 15m+1h kifayətdir (abunə sayı azalır)
+      const tfs = symGroupOf(symbol) === 'base' ? ALL_TFS : [...TIMEFRAMES, TREND_TF];
+      for (const tf of tfs) queue.push({ symbol, tf, tries: 0 });
+    }
+    startPump();
   }
 
   // Cavabdan (symbol, tf) tapır: req_id → subscription.id → echo_req → sahələr
@@ -537,6 +454,7 @@ function connectDeriv() {
     if (msg.error) {
       const m = msg.req_id != null ? reqMeta.get(msg.req_id) : null;
       console.error('[deriv] xəta:', msg.error.message, m ? `(${m.symbol} ${m.tf})` : '');
+      if (m && (msg.error.code === 'RateLimit' || /rate.?limit|too many|exceeded/i.test(msg.error.message || ''))) { requeue(m); return; }
       if (/invalid/i.test(msg.error.message || '') && m) {
         invalidCount++;
         if (!gotCandles && invalidCount >= state.activeSymbols.length * ALL_TFS.length) {
@@ -552,6 +470,8 @@ function connectDeriv() {
       const nameOf = (s) => s.underlying_symbol_name || s.display_name || '';
       const synthetic = list.filter(s => s.market === 'synthetic_index');
       state.availableSymbols = all;
+      updateSymMeta(list);
+      if (subscribedOnce) return; // dövri yeniləmə: yalnız bazar statusu
       console.log(`[deriv] cəmi ${all.length} simvol, ${synthetic.length} sintetik`);
       if (!list.length) {
         console.warn('[deriv] xam cavab:', String(raw).slice(0, 300));
@@ -572,7 +492,15 @@ function connectDeriv() {
         }
         console.warn(`[deriv] simvol tapılmadı: ${want}`);
       }
-      const finalSymbols = [...new Set(resolved)];
+      for (const sym of resolved) state.symGroup.set(sym, 'base');
+      // Əlavə bazarlar: forex, kripto, qızıl/gümüş/neft, 200-500 indekslər + əl ilə EXTRA_SYMBOLS
+      const extras = selectExtraSymbols(list);
+      for (const sym of EXTRA_SYMBOLS) if (all.includes(sym) && !extras.some((e) => e.symbol === sym)) extras.push({ symbol: sym, group: 'extra' });
+      for (const e of extras) { if (!state.symGroup.has(e.symbol)) state.symGroup.set(e.symbol, e.group); resolved.push(e.symbol); }
+      let finalSymbols = [...new Set(resolved)];
+      if (finalSymbols.length > MAX_SYMBOLS) { console.warn(`[deriv] ${finalSymbols.length} simvol tapıldı, MAX_SYMBOLS=${MAX_SYMBOLS} ilə məhdudlaşdırıldı`); finalSymbols = finalSymbols.slice(0, MAX_SYMBOLS); }
+      const counts = {}; for (const sym of finalSymbols) { const g = symGroupOf(sym); counts[g] = (counts[g] || 0) + 1; }
+      console.log('[deriv] qruplar:', JSON.stringify(counts));
 
       if (!finalSymbols.length) {
         rotate('heç bir simvol tapılmadı');
@@ -580,6 +508,7 @@ function connectDeriv() {
       }
       state.activeSymbols = finalSymbols;
       console.log(`[deriv] İstifadə olunan simvollar: ${finalSymbols.join(', ')}`);
+      subscribedOnce = true;
       subscribeCandles(finalSymbols);
       return;
     }
@@ -613,6 +542,7 @@ function connectDeriv() {
   ws.on('close', () => {
     state.derivConnected = false;
     clearInterval(pingTimer);
+    queue.length = 0;
     if (!opened && DERIV_WS_URLS.length > 1) urlIdx++;
     const delay = reconnectDelay;
     console.log(`[deriv] bağlantı kəsildi, ${Math.round(delay / 1000)} saniyə sonra yenidən qoşulacaq`);
@@ -691,6 +621,8 @@ async function connectTradingWs() {
       tradingAuthError = null;
       tradingAuthorized = true;
       console.log(`[trading] qoşuldu — hesab: ${tradingAccountId} (${tradingIsVirtual ? 'DEMO' : 'REAL'}), valyuta: ${tradingCurrency}`);
+      // Yenidən qoşulmadan sonra açıq müqavilələrin izlənməsini bərpa et
+      for (const id of openTrades.keys()) watchContract(id);
       clearInterval(tradingPingTimer);
       tradingPingTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ping: 1 }));
@@ -698,6 +630,7 @@ async function connectTradingWs() {
     });
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw); } catch { return; }
+      if (msg.msg_type === 'proposal_open_contract') { try { handleOpenContract(msg); } catch (e) { console.error('[trading] open_contract xətası:', e.message); } }
       if (msg.req_id && tradingPending.has(msg.req_id)) {
         const p = tradingPending.get(msg.req_id);
         tradingPending.delete(msg.req_id);
@@ -736,114 +669,85 @@ function tradingRequest(payload, timeoutMs = 10000) {
   });
 }
 
-// Yeni API: birbaşa "buy" yoxdur, əvvəlcə "proposal" (qiymət təklifi), sonra onun id-si ilə "buy"
-// expectedPrice: siqnal mesajında göstərilən "Giriş" qiyməti (Telegram düyməsindən gəlir).
-// Proposal cavabındakı "spot" — sorğunun getdiyi AN bazarda olan həqiqi qiymətdir; bu ikisi
-// arasındakı fərq (sürüşmə/slippage) hesablanır. MAX_SLIPPAGE_PCT > 0 və fərq bu həddi keçirsə,
-// alış həyata keçirilmədən SlippageError atılır (heç bir pul xərclənmir).
-class SlippageError extends Error {
-  constructor(expected, actual, diffPct) {
-    super(`Qiymət çox dəyişib (mesajdakı: ${expected}, indiki: ${actual}, fərq: ${diffPct.toFixed(3)}%)`);
-    this.name = 'SlippageError';
-    this.expected = expected; this.actual = actual; this.diffPct = diffPct;
-  }
+// Multiplier müqaviləsi üçün icazə verilən multiplier siyahısı.
+// Qaytarır: massiv (dəstəklənir) | null (dəqiq dəstəklənmir) | undefined (cavab oxuna bilmədi — naməlum)
+const mulCache = new Map();
+async function getMultiplierRange(symbol) {
+  const c = mulCache.get(symbol);
+  if (c && Date.now() - c.ts < 6 * 3600 * 1000) return c.range;
+  const msg = await tradingRequest({ contracts_for: symbol, currency: tradingCurrency || 'USD' });
+  const avail = msg?.contracts_for?.available;
+  if (!Array.isArray(avail) || !avail.length) return undefined;
+  const mult = avail.find((a) => /^MULT(UP|DOWN)$/i.test(a.contract_type || '') || String(a.contract_category || '').toLowerCase() === 'multiplier');
+  const range = mult && Array.isArray(mult.multiplier_range) && mult.multiplier_range.length ? mult.multiplier_range.map(Number) : (mult ? undefined : null);
+  mulCache.set(symbol, { range, ts: Date.now() });
+  return range;
 }
 
-async function buyContract(symbol, dir, durationMin, expectedPrice) {
-  const proposalMsg = await tradingRequest({
-    proposal: 1,
-    amount: DERIV_STAKE_AMOUNT,
-    basis: 'stake',
-    contract_type: dir,
-    currency: tradingCurrency || 'USD',
-    underlying_symbol: symbol,
-    duration: durationMin,
-    duration_unit: 'm',
-  });
-  const p = proposalMsg.proposal;
-  if (!p?.id) throw new Error('Proposal alınmadı');
-  const actualSpot = Number(p.spot ?? p.underlying_spot);
-  let diffPct = null;
-  if (expectedPrice && Number.isFinite(actualSpot)) {
-    diffPct = Math.abs((actualSpot - expectedPrice) / expectedPrice) * 100;
-    if (MAX_SLIPPAGE_PCT > 0 && diffPct > MAX_SLIPPAGE_PCT) {
-      throw new SlippageError(expectedPrice, actualSpot, diffPct);
-    }
-  }
-  const buyMsg = await tradingRequest({ buy: p.id, price: p.ask_price });
-  return { ...buyMsg.buy, expectedPrice: expectedPrice ?? null, actualSpot: Number.isFinite(actualSpot) ? actualSpot : null, diffPct };
-}
-
-// === Real vaxtda ödəniş faizi ===
-// Sabit PAYOUT_PCT (90%) təxminidir — Deriv-in faktiki ödənişi simvol/vaxta görə fərqlənə bilər.
-// Trading bağlantısı aktivdirsə, hər göndəriləcək siqnal üçün əsl "proposal" sorğusu ilə DƏQİQ
-// ödəniş faizini çəkirik və breakeven-i ONUN üzərindən hesablayırıq — statik təxmindən daha dəqiqdir.
-async function getLivePayoutPct(symbol, dir, durationMin) {
-  if (!tradingAuthorized) return null;
+// TP/SL-li əməliyyat: stake=10$ → TP 20–40% (etibara görə), SL 35% — hər ikisi Deriv serverində avtomatik icra olunur
+async function buyMultiplier(symbol, dir, confidence) {
+  if (pendingBuys.has(symbol)) throw new Error(`${symbol} üzrə alış artıq icra olunur`);
+  for (const t of openTrades.values()) if (t.symbol === symbol) throw new Error(`${symbol} üzrə artıq açıq əməliyyat var`);
+  if (openTrades.size >= MAX_OPEN_TRADES) throw new Error(`Açıq əməliyyat limiti (${MAX_OPEN_TRADES}) dolub`);
+  resetDailyIfNeeded();
+  if (dailyPnl.pnl <= -DAILY_LOSS_LIMIT) throw new Error(`Gündəlik zərər limiti (${DAILY_LOSS_LIMIT}) çatıb — bu gün yeni əməliyyat bloklanıb`);
+  pendingBuys.add(symbol);
   try {
+    const range = await getMultiplierRange(symbol);
+    if (range === null) throw new Error(`${symbol} üçün TP/SL-li (multiplier) müqavilə mövcud deyil`);
+    const mult = range ? pickMultiplier(range, desiredMultiplier(symbol)) : MULT_DEFAULT;
+    const tpPct = tpPctFor(confidence);
+    const tp = round2(DERIV_STAKE_AMOUNT * tpPct / 100);
+    const sl = round2(DERIV_STAKE_AMOUNT * SL_PCT / 100);
     const proposalMsg = await tradingRequest({
       proposal: 1,
       amount: DERIV_STAKE_AMOUNT,
       basis: 'stake',
-      contract_type: dir,
+      contract_type: dir === 'CALL' ? 'MULTUP' : 'MULTDOWN',
       currency: tradingCurrency || 'USD',
       underlying_symbol: symbol,
-      duration: durationMin,
-      duration_unit: 'm',
-    }, 6000);
+      multiplier: mult,
+      limit_order: { take_profit: tp, stop_loss: sl },
+    });
     const p = proposalMsg.proposal;
-    if (!p?.payout || !p?.ask_price) return null;
-    return ((p.payout - p.ask_price) / p.ask_price) * 100;
-  } catch (e) {
-    return null; // sükutla statik PAYOUT_PCT-ə geri qayıdır
+    if (!p?.id) throw new Error('Proposal alınmadı');
+    const buyMsg = await tradingRequest({ buy: p.id, price: p.ask_price });
+    const buy = buyMsg.buy;
+    openTrades.set(String(buy.contract_id), { symbol, dir, stake: DERIV_STAKE_AMOUNT, tp, sl, mult, openedAt: Date.now() });
+    watchContract(buy.contract_id);
+    return { buy, mult, tp, sl, tpPct };
+  } finally {
+    pendingBuys.delete(symbol);
   }
 }
 
 async function sellContract(contractId) {
-  const msg = await tradingRequest({ sell: contractId, price: 0 });
+  const msg = await tradingRequest({ sell: Number(contractId), price: 0 });
   return msg.sell;
 }
 
-// === Gündəlik itki limiti (kill-switch) ===
-// Krip-to botundakı eyni prinsip: gündə balansın müəyyən faizindən çox itirilsə, AL düymələri
-// avtomatik bloklanır — sabahkı balans sıfırlanmasına qədər. Default 0 = deaktiv (istəyə bağlı,
-// çünki bəzi istifadəçilər üçün DEMO hesabda mənası olmaya bilər); real hesabda MAX_DAILY_LOSS_PCT
-// env dəyişənini (məs. 5) təyin etməklə aktivləşdirilir.
-const MAX_DAILY_LOSS_PCT = Number(process.env.MAX_DAILY_LOSS_PCT || 0);
-async function getBalance() {
-  const msg = await tradingRequest({ balance: 1 });
-  return msg?.balance || null;
+// Açıq müqaviləni izləyir: TP/SL işləyib bağlananda Telegram-a xəbər verir, gündəlik P&L-i yeniləyir
+function watchContract(id) {
+  tradingRequest({ proposal_open_contract: 1, contract_id: Number(id), subscribe: 1 })
+    .catch((e) => console.error(`[trading] #${id} izləmə xətası:`, e.message));
 }
-async function checkDailyLossLimit() {
-  if (MAX_DAILY_LOSS_PCT <= 0) return;
-  if (!tradingAuthorized) return;
-  try {
-    const bal = await getBalance();
-    const eq = Number(bal?.balance);
-    if (!eq || isNaN(eq)) return;
-    const now = Date.now(), dayMs = 24 * 60 * 60 * 1000;
-    if (!state.dayStartEquity || now - state.dayStartAt > dayMs) {
-      state.dayStartEquity = eq; state.dayStartAt = now; state.tradingHalted = false; state.haltReason = null;
-      saveState();
-      return;
-    }
-    const dropPct = ((state.dayStartEquity - eq) / state.dayStartEquity) * 100;
-    if (dropPct >= MAX_DAILY_LOSS_PCT && !state.tradingHalted) {
-      state.tradingHalted = true;
-      state.haltReason = `Gündəlik zərər limiti aşıldı: -${dropPct.toFixed(2)}% (limit ${MAX_DAILY_LOSS_PCT}%)`;
-      saveState();
-      await telegram('sendMessage', {
-        chat_id: TELEGRAM_CHAT_ID, parse_mode: 'HTML',
-        text: `🛑 <b>KILL-SWITCH AKTİVLƏŞDİ</b>\n${state.haltReason}\nAL düymələri müvəqqəti bloklandı. Balans növbəti gün sıfırlananda avtomatik bərpa olunacaq.`,
-      });
-    }
-  } catch (e) { console.error('[risk] gündəlik itki yoxlaması xətası:', e.message); }
-}
-setInterval(checkDailyLossLimit, 5 * 60 * 1000);
-
-function expiryMinutes(expiry) {
-  const m = /^(\d+)/.exec(expiry || '');
-  return m ? Number(m[1]) : 15;
+function handleOpenContract(msg) {
+  const c = msg.proposal_open_contract;
+  if (!c) return;
+  const id = String(c.contract_id);
+  const t = openTrades.get(id);
+  if (!t) return;
+  const closed = c.is_sold === 1 || c.is_sold === true || ['sold', 'won', 'lost'].includes(c.status);
+  if (!closed) return;
+  openTrades.delete(id);
+  const profit = Number(c.profit);
+  resetDailyIfNeeded();
+  if (Number.isFinite(profit)) dailyPnl.pnl += profit;
+  if (msg.subscription?.id) tradingRequest({ forget: msg.subscription.id }).catch(() => {});
+  const pct = Number.isFinite(profit) ? (profit / t.stake) * 100 : null;
+  const sign = profit >= 0 ? '+' : '';
+  const text = `${profit >= 0 ? '🟢' : '🔴'} <b>${t.symbol}</b> ${t.dir === 'CALL' ? 'CALL' : 'PUT'} bağlandı: <b>${sign}${Number.isFinite(profit) ? profit.toFixed(2) : '?'} ${tradingCurrency || ''}</b>${pct != null ? ` (${sign}${pct.toFixed(0)}%)` : ''}\nBu gün cəmi: ${dailyPnl.pnl >= 0 ? '+' : ''}${dailyPnl.pnl.toFixed(2)} · açıq: ${openTrades.size}`;
+  if (TELEGRAM_CHAT_ID) telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' });
 }
 
 // Watchdog: WS "açıq" görünsə də Deriv bəzən data axınını səssizcə kəsir.
@@ -864,16 +768,20 @@ function onCandleUpdate(symbol) {
   }, 500));
 }
 
-async function runAnalysis(symbol) {
+function runAnalysis(symbol) {
   let r;
   try { r = fullAnalysis(symbol); }
   catch (e) { console.error(`[analiz] ${symbol} xətası:`, e.message); return; }
   if (!r) return;
+  r.group = symGroupOf(symbol);
   state.lastAnalysis.set(symbol, r);
   broadcast({ type: 'analysis', data: r });
 
   if (!state.scannerEnabled) return;
-  if (r.dir === 'WAIT' || r.confidence < MIN_CONFIDENCE) { state.pendingDir.delete(symbol); return; }
+  const minConf = r.group === 'base' ? MIN_CONFIDENCE : Math.max(MIN_CONFIDENCE, MIN_CONFIDENCE_OTHER);
+  if (r.dir === 'WAIT' || r.confidence < minConf) { state.pendingDir.delete(symbol); return; }
+  // Bazar bağlıdır / dayandırılıb / data köhnədir → siqnal yoxdur
+  if (!marketTradable(symbol) || !isFresh(symbol)) { state.pendingDir.delete(symbol); return; }
 
   // Ən azı 2 ardıcıl analiz eyni istiqaməti təsdiqləməlidir — tək tiklik "yanlış sıçrayış"
   // (qiymətin bir anlıq irəli-geri hərəkəti) siqnal doğurmasın deyə
@@ -893,31 +801,13 @@ async function runAnalysis(symbol) {
   const cooldownPassed = prev && now - prev.ts >= cooldownMs;
   if (!dirChanged && !bigConfidenceShift && !cooldownPassed) return;
 
-  // === Real vaxtda ödəniş faizi (mümkünsə) ===
-  // Trading bağlantısı aktivdirsə, sabit PAYOUT_PCT (90%) təxmini əvəzinə Deriv-dən DƏQİQ ödəniş
-  // faizini çəkirik — breakeven həddi bunun üzərindən hesablanır. Bağlantı yoxdursa/uğursuz olsa,
-  // sükutla statik PAYOUT_PCT/BREAKEVEN_PROB-a geri qayıdır.
-  const livePayoutPct = await getLivePayoutPct(symbol, r.dir, expiryMinutes(r.expiry));
-  r.livePayoutPct = livePayoutPct;
-  r.breakevenProb = livePayoutPct != null ? 100 / (1 + livePayoutPct / 100) : BREAKEVEN_PROB;
-
-  // === Kalibrasiya/EV məlumatı ===
-  // ƏVVƏLKİ VERSİYADA bu, breakeven-dən aşağı bucket-lərdə siqnalı TAM BLOKLAYIRDI. İndi istifadəçi
-  // zəif/riskli siqnalları da görüb ÖZÜ seçmək istədiyi üçün — mesaj hər halda göndərilir, sadəcə
-  // kalibrasiya nəticəsi aşağıdırsa aydın ⚠️ RİSKLİ xəbərdarlığı ilə işarələnir.
   state.lastSignalAt.set(symbol, { dir: r.dir, ts: now, confidence: r.confidence });
-  const calWin = calibratedWinProb(r.symbol, r.confidence);
-  r.riskyBucket = calWin != null && calWin < r.breakevenProb;
-
-  // === İndikator-səviyyəli performans üçün: bu siqnalın hansı konkret səbəblərdən (indikatorlardan)
-  // yarandığını da saxlayırıq ki, nəticə bəlli olanda hansı indikatorların həqiqətən işlədiyini görək ===
-  const entry = { ts: now, symbol, dir: r.dir, confidence: r.confidence, expiry: r.expiry, strength: r.strength, confluence: r.confluence, price: r.price, reasons: r.reasons, calibratedWinProb: calWin, macroTrend: r.macroTrend, range4h: r.range4h, range24h: r.range24h };
+  const entry = { ts: now, symbol, dir: r.dir, confidence: r.confidence, expiry: r.expiry, strength: r.strength, confluence: r.confluence, price: r.price, reasons: r.reasons };
   state.signals.unshift(entry);
   state.signals = state.signals.slice(0, 200);
   saveState();
   broadcast({ type: 'signal', data: entry });
   sendTelegramSignal(r);
-  scheduleOutcomeCheck(entry); // real pul qoyulmasa belə, bu siqnalın "virtual" nəticəsini izləyib özünü-kalibrləmə üçün topla
 }
 
 async function telegram(method, body, attempt = 1) {
@@ -947,59 +837,40 @@ async function telegram(method, body, attempt = 1) {
   }
 }
 function confBar(pct) { const filled = Math.round((pct || 0) / 10); return '█'.repeat(filled) + '░'.repeat(10 - filled); }
-// === Yekun "qərar" sətri ===
-// Bütün rəqəmləri (güc, kalibrasiya, risk) TƏK bir aydın tövsiyəyə çevirir — məqsəd, istifadəçinin
-// hər dəfə özü rəqəmləri yozmasının əvəzinə, təcrübəli treyderin deyəcəyi kimi birbaşa bir cümlə
-// görməsidir. QEYD: bu, hələ də heuristik — real treyder sezgisini əvəz etmir, sadəcə mövcud
-// göstəriciləri daha oxunaqlı yekunlaşdırır.
-function verdict(r, calWin) {
-  const breakeven = r.breakevenProb ?? BREAKEVEN_PROB;
-  if (r.riskyBucket) return { tag: '🚫 KEÇ', note: 'Bu etibar aralığı tarixən breakeven-dən aşağı nəticə verib — bu setup-ı ötürmək daha ağıllıdır.' };
-  const strong = r.strength && r.strength.includes('güclü');
-  const mid = r.strength && r.strength.includes('orta');
-  if (strong && (calWin == null || calWin >= breakeven + 5)) return { tag: '✅ BURADAN GİR', note: 'Güclü uyğunluq, tarixi nəticə də dəstəkləyir (və ya hələ kifayət qədər tarixçə yoxdur).' };
-  if (mid) return { tag: '🤔 EHTİYATLA DÜŞÜN', note: 'Orta gücdə setup — kiçik stake ilə, ya da sadəcə izləyərək qərar verin.' };
-  return { tag: '👀 SADƏCƏ İZLƏ', note: 'Zəif meyl — real fürsət deyil, yalnız məlumat üçündür.' };
-}
 function fmt(x) { return x == null ? '--' : Number(x).toLocaleString('en-US', { maximumFractionDigits: 5 }); }
-function macroEmoji(t) { return t === 'up' ? '🟢 yuxarı' : t === 'down' ? '🔴 aşağı' : t ? '⚪ neytral' : '—'; }
-function rangeText(r) { return r ? `${fmt(r.lo)} – ${fmt(r.hi)}` : '—'; }
+const GROUP_EMOJI = { base: '🎲', forex: '💱', crypto: '🪙', commodity: '🥇', synthetic: '📊', extra: '➕' };
 async function sendTelegramSignal(r) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) { console.error('[telegram] TOKEN/CHAT_ID boşdur, siqnal göndərilmədi'); return; }
   const emoji = r.dir === 'CALL' ? '📈' : '📉';
-  const dirText = r.dir === 'CALL' ? '🟢 LONG (AL)' : '🔴 SHORT (SAT)';
-  const expText = r.expiry === '15m' ? '15 dəqiqə' : '5 dəqiqə';
-  const calWin = calibratedWinProb(r.symbol, r.confidence);
-  const breakeven = r.breakevenProb ?? BREAKEVEN_PROB;
-  const calText = calWin != null
-    ? `${calWin.toFixed(0)}% (breakeven: ${breakeven.toFixed(0)}%${r.livePayoutPct != null ? ', real ödəniş' : ', təxmini'})`
-    : `hələ kifayət qədər tarixi nəticə yoxdur (min. ${MIN_SAMPLES_FOR_CALIBRATION})`;
-  const autoTradeNote = DERIV_API_TOKEN
-    ? '<i>Aşağıdakı düymə ilə bir kliklə Deriv-də əməliyyat açıla bilər.</i>'
-    : '<i>Bu avtomatik texniki siqnaldır, maliyyə məsləhəti deyil. Auto-trade hələ aktiv deyil.</i>';
-  const v = verdict(r, calWin);
+  const dirText = r.dir === 'CALL' ? 'CALL (yuxarı)' : 'PUT (aşağı)';
+  const confluenceText = r.confluence != null ? ` — 🟢${r.confluence}/3` : '';
+  const tpPct = tpPctFor(r.confidence);
+  const tp = round2(DERIV_STAKE_AMOUNT * tpPct / 100), sl = round2(DERIV_STAKE_AMOUNT * SL_PCT / 100);
+
+  // Bu simvolda TP/SL-li müqavilə varmı? (dəqiq "yoxdur" cavabı gəlsə düymə göstərilmir)
+  let canTrade = !!DERIV_API_TOKEN;
+  let note = '<i>Bu avtomatik texniki siqnaldır, maliyyə məsləhəti deyil. Auto-trade hələ aktiv deyil.</i>';
+  if (DERIV_API_TOKEN) {
+    note = '<i>Aşağıdakı düymə ilə bir kliklə əməliyyat açılır; TP/SL Deriv tərəfindən avtomatik icra olunur.</i>';
+    if (tradingAuthorized) {
+      try {
+        const range = await getMultiplierRange(r.symbol);
+        if (range === null) { canTrade = false; note = '⚠️ <i>Bu simvolda TP/SL-li (multiplier) müqavilə yoxdur — yalnız siqnal.</i>'; }
+      } catch (e) { /* müvəqqəti xəta: düymə yenə də göstərilir, klikdə yoxlanılacaq */ }
+    }
+  }
   const lines = [
-    `${v.tag}`,
-    `<i>${v.note}</i>`,
-    ``,
-    `💎 <b>${r.symbol}</b>   ${r.strength}`,
-    `${dirText}   Etibar: <b>${r.confidence}%</b> ${confBar(r.confidence)}`,
-    `📍 Giriş: <code>${fmt(r.price)}</code>`,
-    `⏱ Expiry: <b>${expText}</b>${r.confluence != null ? ` (🟢${r.confluence}/3 taymfreym uyğun)` : ''}`,
-    `${emoji} Kalibrlənmiş nəticə: <b>${calText}</b>`,
+    `${GROUP_EMOJI[r.group] || ''} ${emoji} <b>${r.symbol}</b> — <b>${dirText}</b>${confluenceText}`,
+    `Güc: ${r.strength}`,
+    `Etibar: <b>${r.confidence}%</b> ${confBar(r.confidence)}`,
+    `Qiymət: <code>${fmt(r.price)}</code>`,
+    `Plan: stake ${DERIV_STAKE_AMOUNT}$ · TP +${tp}$ (${tpPct.toFixed(0)}%) · SL −${sl}$ (${SL_PCT}%)`,
+    `Səbəblər: ${r.reasons.join(', ')}`,
+    note,
   ];
-  if (r.riskyBucket) lines.push('⚠️ <b>RİSKLİ</b> — bu etibar aralığında keçmiş nəticələr breakeven-dən aşağıdır, ehtiyatlı olun.');
-  lines.push(
-    `📅 Makro (1D): ${macroEmoji(r.macroTrend)}`,
-    `📊 4H aralıq: ${rangeText(r.range4h)}`,
-    `📊 24H aralıq: ${rangeText(r.range24h)}`,
-    `🧩 Səbəblər: ${r.reasons.join(', ')}`,
-    `<i>ℹ️ Bu Rise/Fall (sabit ödənişli) opsiondur — açıq mövqe olmadığı üçün Stop Loss/Take Profit/Leverage tətbiq olunmur; müqavilə ${expText} sonra avtomatik bağlanır.</i>`,
-    autoTradeNote,
-  );
   const btnText = r.dir === 'CALL' ? '🟢 AL (CALL)' : '🔴 SAT (PUT)';
-  const reply_markup = DERIV_API_TOKEN
-    ? { inline_keyboard: [[{ text: btnText, callback_data: `B|${r.symbol}|${r.dir}|${expiryMinutes(r.expiry)}|${r.price}` }]] }
+  const reply_markup = canTrade
+    ? { inline_keyboard: [[{ text: btnText, callback_data: `B|${r.symbol}|${r.dir}|${Math.round(r.confidence)}` }]] }
     : undefined;
   await telegram('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text: lines.join('\n'), parse_mode: 'HTML', reply_markup });
 }
@@ -1017,22 +888,14 @@ async function handleCallbackQuery(cq) {
   const baseText = cq.message.text || '';
   try {
     if (data.startsWith('B|')) {
-      if (state.tradingHalted) {
-        await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: `🛑 Bloklanıb: ${state.haltReason || 'kill-switch aktiv'}`, show_alert: true });
-        return;
-      }
-      const [, symbol, dir, durStr, priceStr] = data.split('|');
-      const durMin = Number(durStr) || 15;
-      const expectedPrice = priceStr ? Number(priceStr) : null;
-      const buy = await buyContract(symbol, dir, durMin, expectedPrice);
+      const [, symbol, dir, confStr] = data.split('|');
+      const res = await buyMultiplier(symbol, dir, Number(confStr) || MIN_CONFIDENCE);
+      const buy = res.buy;
       const acc = tradingIsVirtual ? 'DEMO' : 'REAL';
       const closeBtn = { inline_keyboard: [[{ text: '🔴 Bağla (indi sat)', callback_data: `S|${buy.contract_id}` }]] };
-      const slipLine = buy.diffPct != null
-        ? `\n💹 Mesajdakı qiymət: ${fmt(buy.expectedPrice)} → Faktiki giriş: ${fmt(buy.actualSpot)} (fərq: ${buy.diffPct.toFixed(3)}%)`
-        : '';
       await telegram('editMessageText', {
         chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-        text: `${baseText}\n\n✅ <b>ALINDI (${acc})</b> — stake: ${DERIV_STAKE_AMOUNT} ${tradingCurrency || ''} · #${buy.contract_id}${slipLine}`,
+        text: `${baseText}\n\n✅ <b>ALINDI (${acc})</b> — stake: ${DERIV_STAKE_AMOUNT} ${tradingCurrency || ''} · ×${res.mult}\nTP +${res.tp} (${res.tpPct.toFixed(0)}%) · SL −${res.sl} (${SL_PCT}%) · #${buy.contract_id}`,
         reply_markup: closeBtn,
       });
       await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: '✅ Alındı' });
@@ -1047,38 +910,25 @@ async function handleCallbackQuery(cq) {
     }
   } catch (e) {
     console.error('[telegram] callback xətası:', e.message);
-    if (e.name === 'SlippageError') {
-      await telegram('answerCallbackQuery', {
-        callback_query_id: cq.id,
-        text: `⚠️ Qiymət çox dəyişib, alış edilmədi.\nMesajdakı: ${fmt(e.expected)}\nİndiki: ${fmt(e.actual)}\nFərq: ${e.diffPct.toFixed(3)}% (limit: ${MAX_SLIPPAGE_PCT}%)`,
-        show_alert: true,
-      });
-    } else {
-      await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: `❌ Xəta: ${e.message}`, show_alert: true });
-    }
+    await telegram('answerCallbackQuery', { callback_query_id: cq.id, text: `❌ Xəta: ${e.message}`, show_alert: true });
   }
 }
 
 let tgUpdateOffset = 0;
-let tgPollDelay = 500; // uğursuz cəhdlərdə tədricən artır (max 30s) — Conflict zamanı iki instansiyanın bir-birini daim "boğmasının" qarşısını alır
 async function pollTelegramUpdates() {
   if (!TELEGRAM_TOKEN) return;
   try {
     const res = await telegram('getUpdates', { offset: tgUpdateOffset, timeout: 25, allowed_updates: ['callback_query'] });
     if (res && res.ok && Array.isArray(res.result)) {
-      tgPollDelay = 500; // uğurlu cavab — gecikməni sıfırla
       for (const upd of res.result) {
         tgUpdateOffset = upd.update_id + 1;
         if (upd.callback_query) await handleCallbackQuery(upd.callback_query);
       }
-    } else if (res && res.ok === false) {
-      tgPollDelay = Math.min(tgPollDelay * 2, 30000); // Conflict və s. — geriyə-çəkilmə
     }
   } catch (e) {
     console.error('[telegram] polling xətası:', e.message);
-    tgPollDelay = Math.min(tgPollDelay * 2, 30000);
   } finally {
-    setTimeout(pollTelegramUpdates, tgPollDelay);
+    setTimeout(pollTelegramUpdates, 500);
   }
 }
 
@@ -1092,50 +942,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-app.get('/api/stats', (req, res) => {
-  const buckets = [...state.outcomeStats.entries()]
-    .map(([k, s]) => {
-      const [symbol, bucketStr] = k.split('|');
-      const bucket = Number(bucketStr);
-      const total = s.wins + s.losses;
-      const wilson = total ? +(wilsonLowerBound(s.wins, total) * 100).toFixed(1) : null;
-      return {
-        symbol,
-        bucket: `${bucket}-${bucket + CONF_BUCKET_SIZE - 1}%`,
-        wins: s.wins,
-        losses: s.losses,
-        total,
-        winRate: total ? +((100 * s.wins) / total).toFixed(1) : null,
-        wilsonLowerBound: wilson,
-        calibrated: total >= MIN_SAMPLES_FOR_CALIBRATION,
-      };
-    })
-    .sort((a, b) => a.symbol.localeCompare(b.symbol) || a.bucket.localeCompare(b.bucket));
-  res.json({
-    payoutPct: PAYOUT_PCT,
-    breakevenProb: +BREAKEVEN_PROB.toFixed(1),
-    minSamplesForCalibration: MIN_SAMPLES_FOR_CALIBRATION,
-    pendingOutcomes: state.pendingOutcomes.length,
-    note: 'winRate xam nisbətdir; wilsonLowerBound (EV filtrində istifadə olunan) konservativ qiymətdir və az nümunədə winRate-dən aşağı olacaq — bu normaldır.',
-    buckets,
-  });
-});
-app.get('/api/indicator-stats', (req, res) => {
-  // Hansı konkret indikatorun (səbəbin) tarixən daha çox qazandırdığını/uduzdurduğunu göstərir.
-  // QEYD: bu, HƏLƏ scoring-ə avtomatik təsir etmir (kifayət qədər nümunə yığılana qədər riskli olardı) —
-  // sadəcə izləmə/qərar dəstəyi üçündür. Kifayət qədər data toplananda buradan çəki tənzimləməsi edilə bilər.
-  const rows = [...state.indicatorStats.entries()]
-    .map(([reason, s]) => {
-      const total = s.wins + s.losses;
-      return {
-        reason, wins: s.wins, losses: s.losses, total,
-        winRate: total ? +((100 * s.wins) / total).toFixed(1) : null,
-        wilsonLowerBound: total ? +(wilsonLowerBound(s.wins, total) * 100).toFixed(1) : null,
-      };
-    })
-    .sort((a, b) => b.total - a.total);
-  res.json({ minSamplesForTrust: MIN_SAMPLES_FOR_CALIBRATION, indicators: rows });
-});
 app.get('/api/state', (req, res) => {
   res.json({
     online: true,
@@ -1145,9 +951,6 @@ app.get('/api/state', (req, res) => {
     signals: state.signals.slice(0, 50),
     analysis: Object.fromEntries(state.lastAnalysis),
     startedAt: state.startedAt,
-    tradingHalted: state.tradingHalted,
-    haltReason: state.haltReason,
-    persistence: pgPool ? 'postgres' : 'file (müvəqqəti — DATABASE_URL yoxdur)',
   });
 });
 app.get('/api/analyze/:sym', (req, res) => {
@@ -1198,13 +1001,6 @@ async function verifyTelegramOnBoot() {
     return;
   }
   console.log(`[telegram] Bot təsdiqləndi: @${me.result.username}`);
-  // Unudulmuş/köhnə webhook aktivdirsə, getUpdates (uzun-polling) onunla İŞLƏMİR və Conflict xətası verir —
-  // ona görə hər startup-da avtomatik yoxlanılıb təmizlənir (bu, polling başlamazdan ƏVVƏL edilməlidir).
-  const wh = await telegram('getWebhookInfo', {});
-  if (wh?.ok && wh.result?.url) {
-    console.warn(`[telegram] Aktiv webhook tapıldı (${wh.result.url}) — getUpdates ilə uyğun gəlmir, silinir...`);
-    await telegram('deleteWebhook', {});
-  }
   await telegram('sendMessage', {
     chat_id: TELEGRAM_CHAT_ID,
     text: '✅ Deriv siqnal botu işə düşdü və bağlıdır.',
@@ -1226,7 +1022,7 @@ async function reportTradingStatusOnBoot() {
     const acc = tradingIsVirtual ? 'DEMO' : 'REAL ⚠️';
     await telegram('sendMessage', {
       chat_id: TELEGRAM_CHAT_ID,
-      text: `✅ Trading bağlantısı hazırdır — hesab: ${acc} (${tradingAccountId}), valyuta: ${tradingCurrency}, stake: ${DERIV_STAKE_AMOUNT}. AL/Bağla düymələri aktivdir.`,
+      text: `✅ Trading bağlantısı hazırdır — hesab: ${acc} (${tradingAccountId}), valyuta: ${tradingCurrency}, stake: ${DERIV_STAKE_AMOUNT}, TP ${TP_MIN_PCT}–${TP_MAX_PCT}%, SL ${SL_PCT}%, gündəlik zərər limiti: ${DAILY_LOSS_LIMIT}. AL/Bağla düymələri aktivdir.`,
     });
   } else {
     await telegram('sendMessage', {
@@ -1236,13 +1032,9 @@ async function reportTradingStatusOnBoot() {
   }
 }
 
-async function main() {
-  await initDb();
-  await loadState();
-  connectDeriv();
-  connectTradingWs();
-  await verifyTelegramOnBoot(); // webhook təmizlənməsi polling BAŞLAMAZDAN ƏVVƏL bitməlidir (Conflict-in qarşısını alır)
-  pollTelegramUpdates();
-  reportTradingStatusOnBoot();
-}
-main();
+loadState();
+connectDeriv();
+connectTradingWs();
+pollTelegramUpdates();
+verifyTelegramOnBoot();
+reportTradingStatusOnBoot();
